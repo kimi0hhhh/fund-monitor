@@ -163,11 +163,11 @@ def fetch_holdings(code):
     if key in _holdings_cache:
         return _holdings_cache[key]
     try:
-        h = {"User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 "
-                           "Chrome/120.0 Mobile Safari/537.36",
-             "Referer": "https://mpservice.com/"}
+        h = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                           "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Safari/604.1",
+             "Referer": "https://fundf10.eastmoney.com/"}
         url = (f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
-               f"?FCODE={code}&deviceid=W&plat=Wap&product=EFund&version=2.0.0")
+               f"?FCODE={code}&deviceid=Wap&plat=Wap&product=EFund&version=2.0.0")
         r = requests.get(url, headers=h, timeout=10)
         d = r.json()
         stocks = (d.get("Datas") or {}).get("fundStocks", []) or []
