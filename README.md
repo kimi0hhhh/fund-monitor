@@ -47,6 +47,25 @@
 2. 双击 `基金监控.exe` 即可运行，**无需安装**
 3. 依赖 **WebView2 运行时**（Windows 11 和绝大多数 Win10 已自带；缺失时到微软官网搜索 "WebView2 Runtime" 下载安装）
 
+### 2.2 从源码构建（开发 / 改代码后重新打包）
+
+1. 克隆仓库：`git clone https://github.com/kimi0hhhh/fund-monitor.git`
+2. 确保已安装 **Python 3.10+**（安装时勾选 "Add to PATH"）
+3. 在项目根目录打开命令行，执行一键构建（自动创建虚拟环境 → 安装依赖 → 打包）：
+
+   ```
+   python build.py
+   ```
+
+4. 产物在 `dist\基金监控.exe`；加 `--copy-to` 可自动复制到指定目录：
+
+   ```
+   python build.py --copy-to D:\桌面
+   ```
+
+- 更多参数见 `python build.py --help`（如 `--venv` 复用已有环境、`--skip-install` 只打包）
+- 已打包好的成品可直接在 Releases 页下载，无需构建
+
 > 换电脑迁移：把旧电脑 exe 同目录下的所有 `.json` 文件一起拷到新电脑 exe 同目录即可。
 
 ---
