@@ -29,6 +29,7 @@ DATA_FILE = os.path.join(BASE_DIR, "funds_data.json")
 ICON_FILE = os.path.join(BASE_DIR, "app.ico")
 IDLE_FILE = os.path.join(BASE_DIR, "idle_cash.json")
 RATE_FILE = os.path.join(BASE_DIR, "rate_history.json")
+PROXY_FILE = os.path.join(BASE_DIR, "proxy_config.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -36,6 +37,30 @@ HEADERS = {
     "Referer": "http://fund.eastmoney.com/",
 }
 REFRESH_SEC = 30
+
+
+def _load_proxy():
+    """读取代理配置（proxy_config.json 的 proxy 字段），无则返回空串"""
+    try:
+        with open(PROXY_FILE, "r", encoding="utf-8") as f:
+            return (json.load(f).get("proxy") or "").strip()
+    except Exception:
+        return ""
+
+
+def _save_proxy(proxy):
+    with open(PROXY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"proxy": (proxy or "").strip()}, f, ensure_ascii=False, indent=2)
+
+
+def _get_proxies():
+    """返回 requests 用的 proxies 字典；未配置代理返回 None。兼容仅填 host:port。"""
+    p = _load_proxy()
+    if not p:
+        return None
+    if "://" not in p:
+        p = "http://" + p
+    return {"http": p, "https": p}
 
 
 def load_data():
@@ -178,12 +203,105 @@ def _add_trading_days(date_str, days):
     return d.strftime("%Y-%m-%d")
 
 
+def _fetch_estimate(code, base):
+    """多源获取盘中估值，任一源成功即返回 (gz, pct, time, src)，全部失败返回 None。
+    源顺序：天天基金 fundgz → 东财 FundMNFInfo（iPhone UA）→ 蛋卷（自动跟随 301）→ 指数近似。
+    说明：腾讯行情盘中 p[2] 恒为 0 不提供估算；指数近似用跟踪标的（场内 ETF/指数）实时涨跌
+    估算，仅适用于 ETF 联接/指数型基金（FUND_INDEX_MAP 内），作为第三方源被网络屏蔽时的兜底。"""
+    # 1) 天天基金 fundgz（JSONP：jsonpgz({fundcode,gsz,gszzl,gztime,...})）
+    try:
+        r = requests.get(f"https://fundgz.1234567.com.cn/js/{code}.js",
+                         headers=HEADERS, timeout=6, proxies=_get_proxies())
+        m = re.search(r"jsonpgz\(\s*(\{.*\})\s*\)", r.text)
+        if m:
+            d = json.loads(m.group(1))
+            gz = _f(d.get("gsz"))
+            if gz:
+                return gz, _f(d.get("gszzl")), str(d.get("gztime", "")), "fundgz"
+    except Exception:
+        pass
+    # 2) 东财移动端 FundMNFInfo（需手机 UA，桌面 UA 被反爬）
+    try:
+        url = (f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo"
+               f"?FCODE={code}&deviceid=Wap&plat=Wap&product=EFund&version=6.2.8")
+        r = requests.get(url, headers={"User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")},
+            timeout=6, proxies=_get_proxies())
+        d = r.json()
+        if d.get("Success"):
+            data = d.get("Data") or {}
+            gz = _f(data.get("gsz"))
+            if gz:
+                return gz, _f(data.get("gszzl")), str(data.get("gztime", "")), "em"
+    except Exception:
+        pass
+    # 3) 蛋卷（danjuanapp.com 已 301 → danjuanfunds.com，requests 自动跟随）
+    try:
+        r = requests.get(f"https://danjuanapp.com/djapi/fund/estimate-nav/{code}",
+                         headers=HEADERS, timeout=6, proxies=_get_proxies())
+        items = (r.json().get("data") or {}).get("items") or []
+        if items:
+            d = items[-1]
+            gz = _f(d.get("nav") or d.get("gsz"))
+            pct = _f(d.get("percentage") or d.get("gszzl") or d.get("pct"))
+            t = str(d.get("time") or d.get("date") or "")
+            if gz:
+                if pct is None and base.get("nav"):
+                    pct = round((gz - base["nav"]) / base["nav"] * 100, 2)
+                return gz, pct, t, "dj"
+    except Exception:
+        pass
+    # 4) 指数近似（ETF 联接/指数基金 → 跟踪标的全天候实时涨跌）
+    return _fetch_index_estimate(code, base)
+
+
+# 基金代码 → 跟踪标的行情代码（替代估值源：腾讯场内 ETF/指数实时行情）
+# 仅覆盖指数型/ETF 联接/黄金联接基金；主动混合与 QDII 无标的，不做近似
+FUND_INDEX_MAP = {
+    "025857": "sz159326",  # 华夏中证电网设备ETF联接C → 电网设备ETF华夏
+    "017193": "sh512400",  # 天弘中证工业有色金属联接C → 有色金属ETF南方
+    "016786": "sz159845",  # 鹏华中证1000指数增强C → 中证1000ETF华夏
+    "014881": "sz159770",  # 天弘中证机器人联接C → 机器人ETF天弘
+    "018897": "sz159732",  # 易方达消费电子ETF联接C → 消费电子ETF华夏
+    "022485": "sh000510",  # 国金中证A500指数增强A → 中证A500指数
+    "011840": "sz159819",  # 天弘中证人工智能联接C → 人工智能ETF易方达
+    "008087": "sh515050",  # 华夏中证5G通信联接C → 通信ETF华夏
+    "017412": "sz159781",  # 创金合信中证科创创业50增强A → 科创创业ETF易方达
+    "000217": "sh518880",  # 华安黄金ETF联接C → 黄金ETF华安
+    "002963": "sh518880",  # 易方达黄金ETF联接C → 黄金ETF华安
+}
+
+
+def _fetch_index_estimate(code, base):
+    """用基金跟踪标的（场内 ETF/指数，腾讯 qt.gtimg.cn 实时行情）近似估算盘中净值。
+    估算净值 = 昨日官方净值 × (1 + 标的涨跌幅%)；返回 (gz, pct, time, "idx")。"""
+    tcode = FUND_INDEX_MAP.get(code)
+    if not tcode or not base.get("nav"):
+        return None
+    try:
+        r = requests.get(f"http://qt.gtimg.cn/q={tcode}", headers=HEADERS,
+                         timeout=6, proxies=_get_proxies())
+        r.encoding = "gbk"
+        m = re.search(r'v_(\w+)="([^"]*)"', r.text)
+        if m:
+            p = m.group(2).split("~")
+            if len(p) > 32 and _f(p[32]) is not None:
+                pct = _f(p[32])
+                gz = round(base["nav"] * (1 + pct / 100.0), 4)
+                return gz, pct, datetime.now().strftime("%Y-%m-%d %H:%M"), "idx"
+    except Exception:
+        pass
+    return None
+
+
 def fetch_batch(codes):
-    """腾讯批量行情（名称/净值/日涨跌）+ 蛋卷盘中估值"""
+    """腾讯批量行情（名称/净值/日涨跌）+ 多源盘中估值（fundgz/东财/蛋卷）"""
     result = {}
     try:
         q = ",".join(f"jj{c}" for c in codes)
-        r = requests.get(f"http://qt.gtimg.cn/q={q}", headers=HEADERS, timeout=8)
+        r = requests.get(f"http://qt.gtimg.cn/q={q}", headers=HEADERS, timeout=8,
+                          proxies=_get_proxies())
         r.encoding = "gbk"
         for line in r.text.split(";"):
             m = re.search(r'v_jj(\d{6})="([^"]*)"', line)
@@ -212,7 +330,7 @@ def fetch_batch(codes):
         if base is None:
             try:
                 r = requests.get(f"http://qt.gtimg.cn/q=jj{code}",
-                                 headers=HEADERS, timeout=8)
+                                 headers=HEADERS, timeout=8, proxies=_get_proxies())
                 r.encoding = "gbk"
                 m = re.search(r'v_jj(\d{6})="([^"]*)"', r.text)
                 if m:
@@ -231,20 +349,16 @@ def fetch_batch(codes):
                 pass
             continue
         try:
-            r = requests.get(f"https://danjuanapp.com/djapi/fund/estimate-nav/{code}",
-                             headers=HEADERS, timeout=6)
-            items = (r.json().get("data") or {}).get("items") or []
-            if items:
-                d = items[-1]
-                gz = _f(d.get("nav") or d.get("gsz"))
-                pct = _f(d.get("percentage") or d.get("gszzl") or d.get("pct"))
-                if pct is None and gz and base.get("nav"):
-                    pct = round((gz - base["nav"]) / base["nav"] * 100, 2)
-                if gz is not None:
-                    base["gz"] = gz
-                    if pct is not None:
-                        base["gz_pct"] = pct
-                    base["est"] = True
+            est = _fetch_estimate(code, base)
+            if est:
+                base["gz"] = est[0]
+                if est[1] is not None:
+                    base["gz_pct"] = est[1]
+                if est[2]:
+                    base["gz_time"] = est[2]
+                    base["qdate"] = _qdate(est[2])
+                base["est"] = True
+                base["est_src"] = est[3] if len(est) > 3 else ""
         except Exception:
             pass
     return result
@@ -253,7 +367,8 @@ def fetch_batch(codes):
 def fetch_benchmark_pct():
     """获取沪深300指数当日涨跌幅（腾讯行情 sh000300，GBK），用于基准对比线"""
     try:
-        r = requests.get("http://qt.gtimg.cn/q=sh000300", headers=HEADERS, timeout=6)
+        r = requests.get("http://qt.gtimg.cn/q=sh000300", headers=HEADERS, timeout=6,
+                         proxies=_get_proxies())
         r.encoding = "gbk"
         m = re.search(r'v_sh000300="([^"]*)"', r.text)
         if m:
@@ -272,7 +387,8 @@ def is_market_open_today():
     接口失败时兜底按周末判断。
     """
     try:
-        r = requests.get("http://qt.gtimg.cn/q=sh000300", headers=HEADERS, timeout=6)
+        r = requests.get("http://qt.gtimg.cn/q=sh000300", headers=HEADERS, timeout=6,
+                         proxies=_get_proxies())
         r.encoding = "gbk"
         m = re.search(r'v_sh000300="([^"]*)"', r.text)
         if m:
@@ -393,7 +509,9 @@ class Api:
                 "shares": shares,
                 "gz": gz,
                 "gz_time": info.get("gz_time", ""),
+                "qdate": info.get("qdate", ""),
                 "est": info.get("est", False),
+                "est_src": info.get("est_src", ""),
                 "found": code in self.info,
                 "pending_count": len(d.get("pending", [])),
                 "confirm_days": int(d.get("confirm_days", 1)),
@@ -849,6 +967,15 @@ class Api:
         if api_key: cfg["api_key"] = api_key
         fa.save_config(cfg)
         return {"ok": True, "configured": fa.is_configured()}
+
+    def get_proxy_config(self):
+        """读取代理配置"""
+        return {"ok": True, "proxy": _load_proxy()}
+
+    def save_proxy_config(self, proxy):
+        """保存代理配置（空串=清除代理）"""
+        _save_proxy(proxy or "")
+        return {"ok": True, "proxy": _load_proxy()}
 
     def _get_signal_context(self, code):
         """获取某基金的历史信号（供分析参考，最近 5 条）"""
@@ -1437,6 +1564,7 @@ tbody tr:last-child td{border-bottom:none}
 .badge.flat{background:rgba(var(--sub-rgb),.15);color:var(--sub)}
 .badge.est{background:rgba(var(--orange-rgb),.12);color:var(--orange)}
 .badge.nav{background:rgba(var(--sub-rgb),.15);color:var(--sub)}
+.stale{color:var(--sub);font-size:10px;margin-left:4px;font-weight:400;opacity:.85}
 .badge.pending{background:rgba(var(--up-rgb),.12);color:var(--up)}
 .badge.rule{background:rgba(var(--purple-rgb),.12);color:var(--purple)}
 .badge.warn{background:rgba(var(--orange-rgb),.15);color:var(--orange)}
@@ -1771,6 +1899,7 @@ tbody tr:last-child td{border-bottom:none}
     <p class="note" id="m_desc"></p>
     <input id="m_amt" placeholder="金额（元）" onkeydown="if(event.key==='Enter')saveModal()">
     <input id="m_amt2" placeholder="累计收益（元）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
+    <input id="m_proxy" placeholder="代理地址（可选）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
     <select id="m_model" style="display:none">
       <option value="deepseek-v4-pro">DeepSeek V4-Pro · 深度推理（推荐）</option>
       <option value="deepseek-v4-flash">DeepSeek V4-Flash · 更快更省</option>
@@ -1862,7 +1991,9 @@ function render(st){
   r.className='v '+cls(rate);
   document.getElementById('count').textContent='持有 '+st.count+' 只基金';
   document.getElementById('updatetime').textContent='更新于 '+st.time;
-  document.getElementById('estnote').textContent='每 '+st.interval+' 秒自动刷新';
+  document.getElementById('estnote').textContent=(st.funds.length&&!st.funds.some(f=>f.est))
+    ? '⚠ 盘中估值不可用，显示最新净值'
+    : '每 '+st.interval+' 秒自动刷新';
   const rz=document.getElementById('realized');
   rz.textContent=(st.realized>0?'+':'')+fmt(st.realized);
   rz.className='v '+cls(st.realized);
@@ -1913,7 +2044,7 @@ function render(st){
   for(const f of funds){
     const tr=document.createElement('tr');
     if(f.code===selCode)tr.className='sel';
-    const badge=f.est?'<span class="badge est">盘中估值</span>':'<span class="badge nav">最新净值</span>';
+    const badge=f.est?(f.est_src==='idx'?'<span class="badge est">指数近似</span>':'<span class="badge est">盘中估值</span>'):'<span class="badge nav">最新净值</span>';
     const cd='<span class="badge rule">T+'+(f.confirm_days||1)+'</span>';
     const pb=f.pending_count?'<span class="badge pending">确认中 '+f.pending_count+'</span>':'';
     // 仓位占比 + 集中度警示（>30% 高亮）
@@ -1928,7 +2059,7 @@ function render(st){
     tr.innerHTML=
       '<td>'+f.code+'</td>'+
       '<td>'+esc(f.name)+badge+cd+pb+'</td>'+
-      '<td class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+'</td>'+
+      '<td class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+(f.est?'':'<small class="stale">'+(f.qdate?f.qdate.slice(5):'昨收')+'</small>')+'</td>'+
       '<td>'+(f.today_pred?'<span class="badge '+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.direction||'')+'</span> '+esc(f.today_pred.expected_pct||''):'<span style="color:var(--sub)">--</span>')+'</td>'+
       '<td>'+(f.value?fmt(f.value):'--')+'</td>'+
       '<td>'+ratioCell+'</td>'+
@@ -2074,6 +2205,7 @@ function openModal(mode){
   const inp=document.getElementById('m_amt');
   const inp2=document.getElementById('m_amt2');
   inp2.style.display='none';
+  document.getElementById('m_proxy').style.display='none';
   document.getElementById('m_model').style.display='none';
   inp.style.display='block';
   inp.dataset.mode='';
@@ -2103,14 +2235,16 @@ function openModal(mode){
 
 async function saveModal(){
   const inp = document.getElementById('m_amt');
-  // 设置模式：保存 LLM API key
+  // 设置模式：保存 LLM API key + 代理
   if(inp && inp.dataset && inp.dataset.mode==='settings'){
     const key = inp.value.trim();
     if(!key){ toast('API key 不能为空', true); return; }
     const model = document.getElementById('m_model').value;
+    const proxy = (document.getElementById('m_proxy').value||'').trim();
     const r = await pywebview.api.save_analysis_config(key, model);
+    const r2 = await pywebview.api.save_proxy_config(proxy);
     closeModal();
-    toast(r.ok?'设置已保存':'保存失败', r.ok?false:true);
+    toast((r.ok&&r2.ok)?'设置已保存':'保存失败', (r.ok&&r2.ok)?false:true);
     if(r.ok) checkAnaConfig();
     return;
   }
@@ -2531,10 +2665,17 @@ function refreshAnaSelects(){
 function openSettings(){
   pywebview.api.get_analysis_config().then(r=>{
     const cfg = r.config || {};
-    document.getElementById('m_title').textContent='分析设置（LLM API）';
-    document.getElementById('m_desc').textContent='填入 API key 并选择模型：Pro 深度推理更准（推荐），Flash 更快更省。';
+    document.getElementById('m_title').textContent='分析设置（LLM API + 代理）';
+    document.getElementById('m_desc').textContent='填入 API key 并选择模型；行情/接口访问异常时，可在此填代理地址（如 10.110.32.68:7897）。';
     const inp = document.getElementById('m_amt');
     document.getElementById('m_amt2').style.display='none';
+    const prx = document.getElementById('m_proxy');
+    prx.style.display='block';
+    prx.value='';
+    pywebview.api.get_proxy_config().then(r2=>{
+      if(r2 && r2.ok && r2.proxy) prx.value = r2.proxy;
+    });
+    prx.placeholder = '代理地址（可选，如 10.110.32.68:7897，留空清除）';
     const sel = document.getElementById('m_model');
     sel.style.display='block';
     sel.value = (cfg.model==='deepseek-v4-flash') ? 'deepseek-v4-flash' : 'deepseek-v4-pro';
@@ -2552,6 +2693,7 @@ function editIdleCash(){
   document.getElementById('m_desc').textContent='你的闲置资金（可用于加减仓）。分析时会据此给出闲钱使用建议。';
   const inp = document.getElementById('m_amt');
   document.getElementById('m_amt2').style.display='none';
+  document.getElementById('m_proxy').style.display='none';
   document.getElementById('m_model').style.display='none';
   inp.value = (state && state.idle_cash) ? state.idle_cash : '';
   inp.placeholder = '闲钱金额（元）';
@@ -3069,6 +3211,7 @@ body.collapsed #mini{padding:10px 12px;gap:0}
 .item .code{color:var(--sub);font-size:11px;flex:none}
 .item .name{flex:1;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .item .pct{font-weight:700;font-size:13px;min-width:58px;text-align:right}
+.item .pct .stale{color:var(--sub);font-size:10px;margin-left:4px;font-weight:400;opacity:.85}
 .item .val{color:var(--sub);font-size:12px;min-width:70px;text-align:right}
 .empty{color:var(--sub);text-align:center;padding:20px 0;font-size:12px}
 
@@ -3172,7 +3315,7 @@ function render(st){
     '<div class="item">'+
       '<span class="code">'+f.code+'</span>'+
       '<span class="name">'+esc(f.name)+'</span>'+
-      '<span class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+'</span>'+
+      '<span class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+(f.est?'':'<small class="stale">'+(f.qdate?f.qdate.slice(5):'昨收')+'</small>')+'</span>'+
       '<span class="val">'+(f.value?fmt(f.value):'--')+'</span>'+
     '</div>'
   ).join('');
