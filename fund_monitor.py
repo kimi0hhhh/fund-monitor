@@ -256,30 +256,62 @@ def _fetch_estimate(code, base):
     return _fetch_index_estimate(code, base)
 
 
-# 基金代码 → 跟踪标的行情代码（替代估值源：腾讯场内 ETF/指数实时行情）
-# 仅覆盖指数型/ETF 联接/黄金联接基金；主动混合与 QDII 无标的，不做近似
+# 基金代码 → 跟踪标的行情代码（替代估值源：腾讯/新浪实时行情近似）
+# kind：idx=指数/ETF联接（较准）｜theme=主动混合/QDII（主题/海外市场近似，粗略）
+# 行情代码：sz/sh=股票ETF与指数（~分隔，涨跌幅 p[32]）；us/hk=海外指数（~分隔）；hf_=外盘期货（,分隔）
 FUND_INDEX_MAP = {
-    "025857": "sz159326",  # 华夏中证电网设备ETF联接C → 电网设备ETF华夏
-    "017193": "sh512400",  # 天弘中证工业有色金属联接C → 有色金属ETF南方
-    "016786": "sz159845",  # 鹏华中证1000指数增强C → 中证1000ETF华夏
-    "014881": "sz159770",  # 天弘中证机器人联接C → 机器人ETF天弘
-    "018897": "sz159732",  # 易方达消费电子ETF联接C → 消费电子ETF华夏
-    "022485": "sh000510",  # 国金中证A500指数增强A → 中证A500指数
-    "011840": "sz159819",  # 天弘中证人工智能联接C → 人工智能ETF易方达
-    "008087": "sh515050",  # 华夏中证5G通信联接C → 通信ETF华夏
-    "017412": "sz159781",  # 创金合信中证科创创业50增强A → 科创创业ETF易方达
-    "000217": "sh518880",  # 华安黄金ETF联接C → 黄金ETF华安
-    "002963": "sh518880",  # 易方达黄金ETF联接C → 黄金ETF华安
+    # ---- 指数 / ETF 联接（idx）----
+    "025857": ("sz159326", "idx"),  # 华夏中证电网设备ETF联接C → 电网设备ETF华夏
+    "017193": ("sh512400", "idx"),  # 天弘中证工业有色金属联接C → 有色金属ETF南方
+    "016786": ("sz159845", "idx"),  # 鹏华中证1000指数增强C → 中证1000ETF华夏
+    "014881": ("sz159770", "idx"),  # 天弘中证机器人联接C → 机器人ETF天弘
+    "018897": ("sz159732", "idx"),  # 易方达消费电子ETF联接C → 消费电子ETF华夏
+    "022485": ("sh000510", "idx"),  # 国金中证A500指数增强A → 中证A500指数
+    "011840": ("sz159819", "idx"),  # 天弘中证人工智能联接C → 人工智能ETF易方达
+    "008087": ("sh515050", "idx"),  # 华夏中证5G通信联接C → 通信ETF华夏
+    "017412": ("sz159781", "idx"),  # 创金合信中证科创创业50增强A → 科创创业ETF易方达
+    "000217": ("sh518880", "idx"),  # 华安黄金ETF联接C → 黄金ETF华安
+    "002963": ("sh518880", "idx"),  # 易方达黄金ETF联接C → 黄金ETF华安
+    # ---- QDII（theme：用海外市场近似，A股盘中取昨晚/实时海外行情）----
+    "024239": ("usNDX", "theme"),   # 华夏全球科技先锋(QDII)C → 纳斯达克100
+    "457001": ("hkHSI", "theme"),   # 国富亚洲机会(QDII)A → 恒生指数（港股盘中实时）
+    "021662": ("hkHSI", "theme"),   # 国富亚洲机会(QDII)C → 恒生指数
+    "163208": ("hf_CL", "theme"),   # 诺安油气能源(QDII-FOF-LOF) → 纽约原油
+    "016665": ("usINX", "theme"),   # 天弘全球高端制造(QDII)C → 标普500
+    "012922": ("usNDX", "theme"),   # 易方达全球成长精选(QDII)C → 纳斯达克100
+    # ---- 主动混合（theme：主题近似，仅供参考）----
+    "025500": ("sz399006", "theme"),  # 东方阿尔法科技智选C → 创业板指
+    "018957": ("sh512660", "theme"),  # 中航机遇领航C → 军工ETF国泰
+    "021528": ("sz399006", "theme"),  # 财通成长优选C → 创业板指
+    "013566": ("sz399967", "theme"),  # 华夏军工安全C → 中证军工
+    "014320": ("sh512480", "theme"),  # 德邦半导体产业C → 半导体ETF国联安
 }
 
 
 def _fetch_index_estimate(code, base):
-    """用基金跟踪标的（场内 ETF/指数，腾讯 qt.gtimg.cn 实时行情）近似估算盘中净值。
-    估算净值 = 昨日官方净值 × (1 + 标的涨跌幅%)；返回 (gz, pct, time, "idx")。"""
-    tcode = FUND_INDEX_MAP.get(code)
-    if not tcode or not base.get("nav"):
+    """用基金跟踪标的实时行情近似估算盘中净值。
+    估算净值 = 昨日官方净值 × (1 + 标的涨跌幅%)；返回 (gz, pct, time, "idx"/"theme")。
+    格式兼容：sz/sh/us/hk 波浪线分隔（涨跌幅 p[32]）；hf_ 外盘期货逗号分隔（现价/昨收算涨跌）。"""
+    item = FUND_INDEX_MAP.get(code)
+    if not item or not base.get("nav"):
         return None
+    tcode, kind = item
     try:
+        if tcode.startswith("hf_"):
+            # 外盘期货（腾讯 hf_CL 等，逗号分隔）：[0]现价 [7]昨收 [12]日期
+            r = requests.get(f"http://qt.gtimg.cn/q={tcode}", headers=HEADERS,
+                             timeout=6, proxies=_get_proxies())
+            r.encoding = "gbk"
+            m = re.search(r'v_(\w+)="([^"]*)"', r.text)
+            if m:
+                p = m.group(2).split(",")
+                if len(p) > 7 and _f(p[0]) and _f(p[7]):
+                    price, last = _f(p[0]), _f(p[7])
+                    pct = round((price - last) / last * 100, 2)
+                    gz = round(base["nav"] * (1 + pct / 100.0), 4)
+                    return gz, pct, datetime.now().strftime("%Y-%m-%d %H:%M"), kind
+            return None
+        # 股票/ETF/指数（波浪线分隔）：p[3]现价 p[32]涨跌幅
         r = requests.get(f"http://qt.gtimg.cn/q={tcode}", headers=HEADERS,
                          timeout=6, proxies=_get_proxies())
         r.encoding = "gbk"
@@ -289,7 +321,7 @@ def _fetch_index_estimate(code, base):
             if len(p) > 32 and _f(p[32]) is not None:
                 pct = _f(p[32])
                 gz = round(base["nav"] * (1 + pct / 100.0), 4)
-                return gz, pct, datetime.now().strftime("%Y-%m-%d %H:%M"), "idx"
+                return gz, pct, datetime.now().strftime("%Y-%m-%d %H:%M"), kind
     except Exception:
         pass
     return None
@@ -2044,7 +2076,11 @@ function render(st){
   for(const f of funds){
     const tr=document.createElement('tr');
     if(f.code===selCode)tr.className='sel';
-    const badge=f.est?(f.est_src==='idx'?'<span class="badge est">指数近似</span>':'<span class="badge est">盘中估值</span>'):'<span class="badge nav">最新净值</span>';
+    const badge=f.est
+      ? (f.est_src==='idx'?'<span class="badge est">指数近似</span>'
+        : f.est_src==='theme'?'<span class="badge est">主题近似</span>'
+        : '<span class="badge est">盘中估值</span>')
+      : '<span class="badge nav">最新净值</span>';
     const cd='<span class="badge rule">T+'+(f.confirm_days||1)+'</span>';
     const pb=f.pending_count?'<span class="badge pending">确认中 '+f.pending_count+'</span>':'';
     // 仓位占比 + 集中度警示（>30% 高亮）
