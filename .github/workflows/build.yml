@@ -1,0 +1,52 @@
+# 自动打包 + 发版：打 v* tag（或手动触发）→ Windows 上装依赖 → PyInstaller 单文件打包 → 上传到 GitHub Release
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build exe (PyInstaller onefile)
+        run: pyinstaller 基金监控.spec --clean --noconfirm
+
+      - name: Rename exe with version tag
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "dev" }
+          Copy-Item "dist\基金监控.exe" "dist\FundMonitor-$tag.exe" -Force
+          Write-Host "Artifact: dist\FundMonitor-$tag.exe"
+
+      - name: Upload artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FundMonitor-exe
+          path: dist/FundMonitor-*.exe
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/FundMonitor-*.exe
+          overwrite: true
+          generate_release_notes: true
