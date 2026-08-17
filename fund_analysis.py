@@ -26,6 +26,7 @@ HISTORY_FILE = os.path.join(BASE_DIR, "analysis_history.json")
 SIGNALS_FILE = os.path.join(BASE_DIR, "signals.json")
 TRADE_REVIEW_FILE = os.path.join(BASE_DIR, "trade_review.json")
 TRADE_LESSONS_FILE = os.path.join(BASE_DIR, "trade_lessons.json")
+PREDICTION_LESSONS_FILE = os.path.join(BASE_DIR, "prediction_lessons.json")
 PROXY_FILE = os.path.join(BASE_DIR, "proxy_config.json")
 
 HEADERS = {
@@ -462,10 +463,35 @@ def _save_history(h):
         json.dump(h, f, ensure_ascii=False, indent=2)
 
 
+def _next_trading_day(d):
+    """返回下一个交易日（仅处理周末，忽略法定节假日）"""
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def compute_forecast_date():
+    """预测目标交易日（分盘中/盘后）：
+
+    - 交易日 15:00 前（盘前 0:00 至盘中 14:59）：当天还没收盘 → 预测「今日」当天涨跌
+    - 交易日 15:00 后 / 周末：当天已收盘或休市 → 预测「下一个交易日」
+
+    关键语义：预测锚定「对哪一天预测」（目标日）。17 号盘前/盘中分析 → 对 17 号；
+    17 号收盘后分析 → 对 18 号。复盘按目标日精确对齐，避免跨日错位。
+    """
+    now = datetime.now()
+    if now.weekday() < 5 and now.hour < 15:
+        return now.strftime("%Y-%m-%d")
+    return _next_trading_day(now).strftime("%Y-%m-%d")
+
+
 def save_prediction(date_str, code, prediction):
     h = _load_history()
     h.setdefault(date_str, {"predictions": {}, "reports": {}})
-    h[date_str]["predictions"][code] = prediction
+    pred = dict(prediction)
+    pred.setdefault("forecast_date", compute_forecast_date())
+    h[date_str]["predictions"][code] = pred
     _save_history(h)
 
 
@@ -564,7 +590,9 @@ def save_trade_reviews(reviews):
 def add_trade_review_from_report(code, name, report, nav=None, pct=None):
     """从分析报告提取加减仓建议（非 HOLD/维持）存入复盘库
 
-    去重：同一基金 + 日期 已有 pending 记录则不重复添加（当天只留最新一条）。
+    锚点：与预测一致的 forecast_date（目标日）——交易日 15:00 前分析 → 对今日的建议；
+    15:00 后及周末 → 对下一交易日的建议。23:00 复盘只复盘"对今天"的建议。
+    去重：同一基金 + forecast_date 已有 pending 记录则不重复添加（同目标日只留最新一条）。
     """
     act = (report or {}).get("action_suggestion") or {}
     verdict = str(act.get("verdict", "") or "").strip().upper()
@@ -575,14 +603,17 @@ def add_trade_review_from_report(code, name, report, nav=None, pct=None):
         return
     reviews = load_trade_reviews()
     today = datetime.now().strftime("%Y-%m-%d")
+    fd = compute_forecast_date()
     for r in reviews:
-        if r.get("code") == code and r.get("date") == today and r.get("status") == "pending":
+        if (r.get("code") == code and r.get("status") == "pending"
+                and (r.get("forecast_date") or r.get("date")) == fd):
             return
     reviews.append({
         "id": uuid.uuid4().hex[:10],
         "code": code,
         "name": name,
         "date": today,
+        "forecast_date": fd,   # 对哪一天的建议（目标日）
         "verdict": verdict,
         "position_change": position_change,
         "rationale": str(act.get("rationale", "") or "").strip(),
@@ -820,7 +851,9 @@ def audit_signal(signal, quote):
 def save_portfolio_prediction(date_str, report):
     h = _load_history()
     h.setdefault(date_str, {"predictions": {}, "reports": {}})
-    h[date_str]["portfolio"] = report
+    rep = dict(report)
+    rep.setdefault("forecast_date", compute_forecast_date())
+    h[date_str]["portfolio"] = rep
     _save_history(h)
 
 
@@ -910,12 +943,20 @@ SYSTEM_PROMPT = """你是一支专业基金投研团队的「主理人」。团�
 """
 
 
-def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, latest_pct, holdings=None, signal_context=None, trade_review_context=None):
+def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, latest_pct, holdings=None, signal_context=None, trade_review_context=None, prediction_review_context=None):
     """把基金数据喂给 LLM"""
     m = metrics or {}
+    _now = datetime.now()
+    _today = _now.strftime("%Y-%m-%d")
+    _fd = compute_forecast_date()
+    if _now.weekday() < 5 and _now.hour < 15:
+        _date_note = f"今天是 {_today}（交易中，尚未收盘），请预测今日 {_today} 的涨跌方向与预期涨幅"
+    else:
+        _date_note = f"今天是 {_today}（已收盘），请预测下一个交易日 {_fd} 的涨跌方向与预期涨幅"
     parts = [
         f"基金代码: {code}",
         f"基金名称: {name}",
+        _date_note,
         f"持有金额: {holding_amount} 元（份额 {shares}）",
         f"最新估值: {latest_gz}",
         f"今日估算涨幅: {latest_pct}%",
@@ -956,6 +997,10 @@ def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, la
     if trade_review_context:
         parts += ["", "【你的加减仓建议历史复盘（请吸取亏损教训，修正本次加减仓建议）】"]
         parts.append(trade_review_context)
+    # 预测复盘结论（方向 + 幅度经验，修正本次预测方向与预期涨幅）
+    if prediction_review_context:
+        parts += ["", "【你的历史预测复盘（请吸取方向与幅度偏差教训，修正本次预测的方向与预期涨幅）】"]
+        parts.append(prediction_review_context)
     parts += ["", "请模拟完整投研团队流水线，给出结构化 JSON 报告。重点输出中期(1-2周)策略而非仅明天涨跌。"]
     return "\n".join(parts)
 
@@ -980,12 +1025,14 @@ def parse_llm_json(content):
 
 
 def analyze_fund(code, name, holding_amount, shares, latest_gz, latest_pct,
-                 progress_cb=None, signal_context=None, trade_review_context=None):
+                 progress_cb=None, signal_context=None, trade_review_context=None,
+                 prediction_review_context=None):
     """单只基金分析主流程（同步，可在后台线程中调用）
 
     progress_cb(msg, pct 0-100) 用于进度回调
     signal_context: 该基金历史信号列表（[{title, direction, status, outcome, created}]），供 AI 参考
     trade_review_context: 加减仓复盘结论文本，供 AI 吸取教训修正建议
+    prediction_review_context: 预测复盘结论文本（方向+幅度经验），供 AI 修正本次预测
     返回 dict {ok, summary, today_analysis, tomorrow_forecast, action_suggestion, raw}
     """
     if progress_cb:
@@ -1004,7 +1051,7 @@ def analyze_fund(code, name, holding_amount, shares, latest_gz, latest_pct,
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(
             code, name, holding_amount, shares, metrics, latest_gz, latest_pct,
-            holdings, signal_context, trade_review_context)},
+            holdings, signal_context, trade_review_context, prediction_review_context)},
     ]
     r = llm_chat(messages, temperature=0.5, max_tokens=3500)
     if progress_cb:
@@ -1080,15 +1127,24 @@ PORTFOLIO_SYSTEM_PROMPT = """你是一名专业的基金组合策略师。你面
 """
 
 
-def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_review_context=None):
+def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_review_context=None, prediction_review_context=None):
     """把持仓组合数据喂给 LLM
 
     signal_contexts: {code: [历史信号...]}，组合层面的 AI 历史判断记录，
     供 AI 参考修正本次组合判断（对错的信号会影响本次结论与可信度）。
     trade_review_context: 加减仓复盘结论文本，供 AI 吸取教训修正建议。
+    prediction_review_context: 预测复盘结论文本（方向+幅度经验），供 AI 修正整体预测。
     """
     total = sum(f.get("value", 0) or 0 for f in funds) or 1.0
-    parts = ["以下是用户当前的全部持仓（共 %d 只基金，总市值 %.2f 元）：" % (len(funds), total), ""]
+    _now = datetime.now()
+    _today = _now.strftime("%Y-%m-%d")
+    _fd = compute_forecast_date()
+    if _now.weekday() < 5 and _now.hour < 15:
+        _date_note = f"今天是 {_today}（交易中，尚未收盘），请预测今日 {_today} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_today} 当日涨跌幅）"
+    else:
+        _date_note = f"今天是 {_today}（已收盘），请预测下一个交易日 {_fd} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_fd} 当日涨跌幅）"
+    parts = ["以下是用户当前的全部持仓（共 %d 只基金，总市值 %.2f 元）：" % (len(funds), total),
+             _date_note, ""]
     for f in funds:
         m = f.get("metrics") or {}
         value = f.get("value", 0) or 0
@@ -1128,17 +1184,22 @@ def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_rev
     if trade_review_context:
         parts += ["", "【你的加减仓建议历史复盘（请吸取亏损教训，修正本次组合加减仓建议）】"]
         parts.append(trade_review_context)
+    # 预测复盘结论（组合层面：方向 + 幅度经验）
+    if prediction_review_context:
+        parts += ["", "【你的历史预测复盘（请吸取方向与幅度偏差教训，修正本次组合整体预测）】"]
+        parts.append(prediction_review_context)
     parts += ["", "请给出：整体持仓结构、板块调整建议、闲钱使用建议（结合单基金加减）、新投资方向建议、整体明日预测，输出 JSON。"]
     return "\n".join(parts)
 
 
-def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=None, trade_review_context=None):
+def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=None, trade_review_context=None, prediction_review_context=None):
     """整体持仓组合分析（同步，可在后台线程调用）
 
     funds: [{code, name, value, gz_pct, metrics}]
     idle_cash: 用户闲置资金（可用于加减仓）
     signal_contexts: {code: [历史信号...]}，供 AI 参考修正组合判断
     trade_review_context: 加减仓复盘结论文本
+    prediction_review_context: 预测复盘结论文本（方向+幅度经验）
     """
     if progress_cb:
         progress_cb("汇总持仓数据...", 20)
@@ -1149,7 +1210,7 @@ def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=No
         progress_cb("调用 AI 组合策略师分析...", 40)
     messages = [
         {"role": "system", "content": PORTFOLIO_SYSTEM_PROMPT},
-        {"role": "user", "content": build_portfolio_prompt(funds, idle_cash, signal_contexts, trade_review_context)},
+        {"role": "user", "content": build_portfolio_prompt(funds, idle_cash, signal_contexts, trade_review_context, prediction_review_context)},
     ]
     r = llm_chat(messages, temperature=0.5, max_tokens=4000)
     if progress_cb:
@@ -1211,42 +1272,45 @@ def compare_prediction(expected_dir, expected_pct_str, actual_pct):
     }
 
 
-def review_prediction(date_str, code, actual_pct):
-    """复盘某天某只基金的预测：对比昨日预测与今日实际"""
-    history = get_history(date_str)
-    if not history:
-        return {"ok": False, "msg": f"未找到 {date_str} 的预测记录"}
-    pred = history.get("predictions", {}).get(code)
+def review_prediction(fd, code, actual_pct, pred=None):
+    """复盘对某目标日（fd）某只基金的预测：对比预测与实际。
+
+    pred 可直接传入预测记录（按目标日聚合复盘的场景，预测分散在多个分析日下，
+    不能用 get_history(fd) 按 key 读）；不传则回退按 fd 当 key 读取（兼容旧调用）。
+    """
+    if pred is None:
+        history = get_history(fd)
+        if not history:
+            return {"ok": False, "msg": f"未找到 {fd} 的预测记录"}
+        pred = history.get("predictions", {}).get(code)
     if not pred:
-        return {"ok": False, "msg": f"未找到 {date_str} {code} 的预测"}
+        return {"ok": False, "msg": f"未找到对 {fd} 的 {code} 预测"}
 
     expected_pct_str = pred.get("tomorrow_forecast", {}).get("expected_pct", "0")
     expected_dir = pred.get("tomorrow_forecast", {}).get("direction", "FLAT")
     result = compare_prediction(expected_dir, expected_pct_str, actual_pct)
-    result.update({"ok": True, "code": code, "date": date_str})
+    result.update({"ok": True, "code": code, "date": fd})
     return result
 
 
-def review_portfolio(date_str, actual_pct):
-    """复盘某天的组合预测：组合预测 vs 组合实际（加权涨跌）"""
-    history = get_history(date_str)
-    if not history:
-        return {"ok": False, "msg": f"未找到 {date_str} 的预测记录"}
-    portfolio = history.get("portfolio")
+def review_portfolio(portfolio, actual_pct, fd=None):
+    """复盘组合预测：portfolio 记录（含 portfolio_forecast）vs 组合实际（加权涨跌）"""
     if not portfolio:
-        return {"ok": False, "msg": f"{date_str} 无组合预测"}
-
+        return {"ok": False, "msg": "无组合预测"}
     pf = portfolio.get("portfolio_forecast", {})
+    if not pf:
+        return {"ok": False, "msg": "无组合预测"}
+
     expected_pct_str = pf.get("expected_pct", "0")
     expected_dir = pf.get("direction", "FLAT")
     result = compare_prediction(expected_dir, expected_pct_str, actual_pct)
-    result.update({"ok": True, "date": date_str, "is_portfolio": True})
+    result.update({"ok": True, "date": fd or "", "is_portfolio": True})
     return result
 
 
-def review_with_ai(date_str, code, actual_pct, fund_name, fund_metrics):
-    """复盘 + 让 AI 分析偏差原因"""
-    base = review_prediction(date_str, code, actual_pct)
+def review_with_ai(fd, code, actual_pct, fund_name, fund_metrics, pred=None):
+    """复盘 + 让 AI 分析偏差原因（pred 可直接传入预测记录，见 review_prediction）"""
+    base = review_prediction(fd, code, actual_pct, pred)
     if not base.get("ok"):
         return base
 
@@ -1282,40 +1346,159 @@ def find_next_pct(history, date_str):
     return None, None
 
 
-def review_all_predictions(date_str):
-    """批量复盘某天全部预测（纯算术，不逐只调 LLM，速度很快）
+def _fd_of(pred, dstr):
+    """预测目标日：优先预测记录里的 forecast_date；
+    旧数据（v2.0.10 及以前）无该字段时 fallback = 分析日后的第一个交易日。"""
+    fd = str((pred or {}).get("forecast_date") or "").strip()
+    if fd:
+        return fd
+    try:
+        return _next_trading_day(datetime.strptime(dstr, "%Y-%m-%d")).strftime("%Y-%m-%d")
+    except Exception:
+        return dstr
 
-    返回 {ok, date, results[], avg_accuracy, direction_correct_count, total}
+
+def list_forecast_dates():
+    """所有预测目标日（对哪天的预测），去重倒序（供复盘/历史按目标日选择）"""
+    h = _load_history()
+    fds = set()
+    for dstr, day in (h or {}).items():
+        for pred in (day.get("predictions") or {}).values():
+            fds.add(_fd_of(pred, dstr))
+        if day.get("portfolio"):
+            fds.add(_fd_of(day.get("portfolio"), dstr))
+    return sorted(fds, reverse=True)
+
+
+def _dir_of(pct):
+    """涨跌幅 → 方向（与 compare_prediction 同一阈值 ±0.05）"""
+    if pct is None:
+        return None
+    if pct > 0.05:
+        return "UP"
+    if pct < -0.05:
+        return "DOWN"
+    return "FLAT"
+
+
+def review_all_predictions(fd):
+    """按目标日复盘：聚合所有「对 fd 的预测」（跨分析日），对比 fd 当天实际。
+
+    预测锚定目标交易日：17 号收盘后与 18 号盘中做的分析都可能是「对 18 号的预测」，
+    它们分散在不同分析日 key 下，这里统一按 forecast_date 聚合复盘。
+    旧数据（无 forecast_date）fallback 为分析日后的第一个交易日。
+    返回 {ok, date=fd, results[], avg_accuracy, direction_correct_count, total, baselines}
     """
-    history = get_history(date_str)
-    if not history:
-        return {"ok": False, "msg": f"未找到 {date_str} 的预测记录"}
-    predictions = history.get("predictions", {})
-    if not predictions:
-        return {"ok": False, "msg": f"{date_str} 没有预测记录"}
+    h = _load_history()
+    agg = {}          # code -> {"pred": 预测记录, "dstr": 分析日}
+    for dstr in sorted((h or {}).keys(), reverse=True):   # 最新分析日优先
+        day = h[dstr]
+        for code, pred in (day.get("predictions") or {}).items():
+            if _fd_of(pred, dstr) == fd and code not in agg:
+                agg[code] = {"pred": pred, "dstr": dstr}
+    if not agg:
+        return {"ok": False, "msg": f"未找到对 {fd} 的预测记录"}
 
     results = []
-    for code in sorted(predictions.keys()):
+    # 基准对照统计（同一批复盘样本）
+    base_ok = []            # 有分析日当天行情的样本（基线可计算的子集）
+    mom_correct = rev_correct = br_correct = 0
+    mom_abs_sum = 0.0
+    for code in sorted(agg.keys()):
+        item = agg[code]
+        pred, dstr = item["pred"], item["dstr"]
         h = fetch_history(code, 60)
-        actual_pct, actual_date = find_next_pct(h, date_str)
+        # 实际 = 目标日 fd 当天的官方涨跌
+        actual_pct = actual_date = None
+        for _h in h:
+            if _h["date"] == fd:
+                actual_pct, actual_date = _h.get("pct"), fd
+                break
         if actual_pct is None:
             results.append({"ok": False, "code": code,
-                            "msg": "尚未到复盘时间（无后续交易日数据）"})
+                            "msg": "尚未到复盘时间（目标日净值未更新）"})
             continue
-        r = review_prediction(date_str, code, actual_pct)
+        r = review_prediction(fd, code, actual_pct, pred)
         r["actual_date"] = actual_date
+        r["forecast_date"] = fd
+        # 有偏差的基金：让 AI 逐只写偏差原因（方向错 或 幅度偏差 >= 0.3%）
+        if not r.get("direction_correct") or r.get("abs_deviation", 0) >= 0.3:
+            metrics = compute_metrics(h)
+            ai = review_with_ai(fd, code, actual_pct, code, metrics, pred)
+            r["deviation_reason"] = ai.get("deviation_reason", "（AI 分析暂不可用）")
         results.append(r)
+
+        # ---- 基准对照：只用该基金分析日（dstr）当天及以前的数据，防数据泄漏 ----
+        base_pct = next((x.get("pct") for x in h if x.get("date") == dstr), None)
+        if base_pct is None:
+            continue
+        base_ok.append(r)
+        actual_dir = r.get("actual_dir")
+        # 1) 动量跟涨：今天涨 → 预测明天涨（幅度=今天涨跌幅）
+        mom_dir = _dir_of(base_pct)
+        if mom_dir == actual_dir:
+            mom_correct += 1
+        # 2) 均值回归：方向与今天相反
+        rev_dir = {"UP": "DOWN", "DOWN": "UP", "FLAT": "FLAT"}.get(mom_dir)
+        if rev_dir == actual_dir:
+            rev_correct += 1
+        mom_abs_sum += abs(actual_pct - base_pct)
+        # 3) 历史频率：近 20 个交易日涨/跌/平哪个多就押哪个
+        recent = [x.get("pct", 0) for x in h if x.get("date") <= dstr][-20:]
+        ups = sum(1 for p in recent if p > 0.05)
+        downs = sum(1 for p in recent if p < -0.05)
+        br_dir = "UP" if ups > downs else ("DOWN" if downs > ups else "FLAT")
+        if br_dir == actual_dir:
+            br_correct += 1
 
     ok_results = [r for r in results if r.get("ok")]
     avg_acc = round(sum(r["accuracy"] for r in ok_results) / len(ok_results), 1) if ok_results else 0
     dir_correct = sum(1 for r in ok_results if r["direction_correct"])
+    # 汇总基线（AI 正确率用与基线相同的子集 base_ok，口径一致才公平）
+    n = len(base_ok)
+    ai_rate = round(sum(1 for r in base_ok if r["direction_correct"]) / n * 100, 1) if n else None
+    mom_rate = round(mom_correct / n * 100, 1) if n else None
+    rev_rate = round(rev_correct / n * 100, 1) if n else None
+    br_rate = round(br_correct / n * 100, 1) if n else None
+    ai_abs = round(sum(r.get("abs_deviation", 0) for r in base_ok) / n, 2) if n else None
+    mom_abs = round(mom_abs_sum / n, 2) if n else None
+    best = max([x for x in (mom_rate, rev_rate, br_rate) if x is not None] + [0])
+    baselines = {
+        "sample": n,
+        "ai_rate": ai_rate, "ai_abs_dev": ai_abs,
+        "momentum_rate": mom_rate, "momentum_abs_dev": mom_abs,
+        "reversal_rate": rev_rate,
+        "base_rate": br_rate,
+        "random_rate": 50.0,
+        "excess_vs_best": round(ai_rate - best, 1) if ai_rate is not None and n else None,
+    }
+    # 信心校准：按 AI 自评 confidence（高/中/低）分档统计实际方向正确率，
+    # 若高档位不比低档位准，说明信心字段不可靠
+    tmp = {}
+    for r in ok_results:
+        pred = agg.get(r.get("code"), {}).get("pred") or {}
+        level = str(((pred.get("tomorrow_forecast") or {}).get("confidence") or "")).strip() or "未知"
+        c = tmp.setdefault(level, {"n": 0, "dc": 0, "acc": 0.0})
+        c["n"] += 1
+        if r.get("direction_correct"):
+            c["dc"] += 1
+        c["acc"] += r.get("accuracy", 0)
+    confidence_calibration = []
+    for level, c in tmp.items():
+        confidence_calibration.append({
+            "level": level, "sample": c["n"],
+            "direction_correct_rate": round(c["dc"] / c["n"] * 100, 1),
+            "avg_accuracy": round(c["acc"] / c["n"], 1)})
+    confidence_calibration.sort(key=lambda x: -x["sample"])
     return {
         "ok": True,
-        "date": date_str,
+        "date": fd,
         "results": results,
         "avg_accuracy": avg_acc,
         "direction_correct_count": dir_correct,
         "total": len(ok_results),
+        "baselines": baselines,
+        "confidence_calibration": confidence_calibration,
     }
 
 
@@ -1349,3 +1532,206 @@ def summarize_review(date_str, review_result):
     if r.get("ok"):
         return r["content"].strip()
     return "（AI 分析暂不可用）"
+
+
+# ================== 预测复盘闭环（方向 + 幅度） ==================
+def load_prediction_lessons():
+    """读取预测复盘经验缓存 {"lessons": [...], "updated": "日期", "stats": {...}}"""
+    try:
+        if os.path.exists(PREDICTION_LESSONS_FILE):
+            with open(PREDICTION_LESSONS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_prediction_lessons(data):
+    try:
+        with open(PREDICTION_LESSONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def summarize_prediction_lessons(date_str, review_result):
+    """复盘完成后调用一次：把预测复盘（方向 + 幅度）提炼成经验教训缓存
+
+    方向复盘：UP/DOWN/FLAT 是否判对 → direction_correct_rate；
+    幅度偏差率（只算方向判对的样本，作为下次预测的修正值）：
+      bias_pct   = mean(实际涨幅 - 预测涨幅)，如预测 +2.0% 实际 +4.0% → +2.0，
+                   为正表示系统性低估涨幅，下次预测应上调；
+      avg_abs_dev = mean(|实际 - 预测|)，衡量预测精度（不关心方向）。
+    只在批量复盘后调用（不随每次分析触发），控制 token 消耗。
+    """
+    ok_results = [r for r in review_result.get("results", []) if r.get("ok")]
+    if not ok_results:
+        return None
+    total = len(ok_results)
+    dir_correct = sum(1 for r in ok_results if r.get("direction_correct"))
+    # 幅度偏差只统计「方向判对」的样本（方向都错了，幅度修正无意义）
+    correct_samples = [r for r in ok_results if r.get("direction_correct")]
+    if correct_samples:
+        devs = [r.get("pct_deviation") or 0 for r in correct_samples]
+        bias_pct = round(sum(devs) / len(devs), 2)          # 修正值：系统性高估/低估
+        avg_abs_dev = round(sum(abs(d) for d in devs) / len(devs), 2)  # 平均绝对偏差
+        over = sum(1 for d in devs if d < -0.2)             # 高估（实际比预测低）
+        under = sum(1 for d in devs if d > 0.2)             # 低估（实际比预测高）
+    else:
+        bias_pct = avg_abs_dev = None
+        over = under = 0
+    lines = [f"复盘日期: {date_str}", "各基金预测 vs 实际（方向与幅度都要看）："]
+    for r in ok_results:
+        lines.append(
+            f"- {r.get('code')} {r.get('name', '')}: "
+            f"预测 {r.get('expected_dir')} {r.get('expected_pct')}%, "
+            f"实际 {r.get('actual_dir')} {r.get('actual_pct')}%, "
+            f"方向{'对' if r.get('direction_correct') else '错'}, "
+            f"偏差 {r.get('pct_deviation')}%")
+    bias_txt = (f"{bias_pct:+.2f}%" if bias_pct is not None else "无")
+    lines.append(
+        f"整体：方向正确率 {dir_correct}/{total}（{round(dir_correct/total*100,1)}%），"
+        f"平均准确率 {review_result.get('avg_accuracy')}%，"
+        f"方向判对的 {len(correct_samples)} 只中：幅度偏差率（实际-预测均值）{bias_txt}"
+        f"（{'系统性低估，下次预测涨幅应上调' if bias_pct is not None and bias_pct > 0 else ''}"
+        f"{'系统性高估，下次预测涨幅应下调' if bias_pct is not None and bias_pct < 0 else ''}"
+        f"{'方向对时幅度基本准确' if bias_pct is not None and bias_pct == 0 else ''}），"
+        f"平均绝对偏差 {avg_abs_dev if avg_abs_dev is not None else '-'}%，"
+        f"高估 {over} 只 / 低估 {under} 只")
+    sys_p = (
+        "你是基金预测复盘教练。基于预测复盘数据（方向准确率 + 幅度偏差率），提炼 3-6 条可执行的"
+        "预测经验教训，帮助下次分析更准确地预测方向与预期涨幅。注意：方向判对的样本里也存在幅度偏差"
+        "（如预测涨 2.0% 实际涨 4.0% → 低估幅度），应针对方向误判/幅度高估/幅度低估分别给改进动作。\n"
+        "输出 JSON：{\"lessons\": [\"经验1\", \"经验2\", ...]}，每条 40 字内。只输出 JSON。"
+    )
+    r = llm_chat([{"role": "system", "content": sys_p},
+                  {"role": "user", "content": "\n".join(lines)}],
+                 temperature=0.4, max_tokens=500)
+    lessons = []
+    if r.get("ok"):
+        parsed = parse_llm_json(r.get("content", ""))
+        if parsed and isinstance(parsed.get("lessons"), list):
+            lessons = [str(x).strip() for x in parsed["lessons"] if str(x).strip()]
+    data = {"lessons": lessons, "updated": date_str,
+            "stats": {"reviewed": total,
+                      "direction_correct_rate": round(dir_correct / total * 100, 1),
+                      "avg_accuracy": review_result.get("avg_accuracy"),
+                      "bias_pct": bias_pct,          # 修正值：+ 表示系统性低估
+                      "avg_abs_dev": avg_abs_dev,    # 平均绝对偏差（精度）
+                      "over_estimate": over, "under_estimate": under,
+                      "baselines": review_result.get("baselines") or {}}}
+    # 滚动历史：按「对哪天的分析」归组（forecast_date）——同一天（同一目标日）重复复盘
+    # 替换最后一条，避免重复累积；保留最近 N 次
+    fd_main = date_str
+    for _r in review_result.get("results", []):
+        if _r.get("forecast_date"):
+            fd_main = _r["forecast_date"]
+            break
+    rec = dict(data["stats"])
+    rec["date"] = fd_main
+    old_hist = load_prediction_lessons().get("history") or []
+    if old_hist and old_hist[-1].get("date") == fd_main:
+        old_hist[-1] = rec
+    else:
+        old_hist.append(rec)
+    data["history"] = old_hist[-ROLLING_MAX:]
+    data["rolling"] = _merge_rolling(data["history"])
+    data["confidence_calibration"] = review_result.get("confidence_calibration") or []
+    save_prediction_lessons(data)
+    return data
+
+
+ROLLING_MAX = 5          # 滚动窗口：最近 5 次复盘
+ROLLING_DECAY = 0.7      # 时间衰减：最近一次权重 1.0，前一次 0.7，再前 0.49……
+
+
+def _merge_rolling(history):
+    """对最近 N 次复盘的 stats 做滚动加权（权重 = 样本量 × 0.7^(距今天数)），
+    返回 {bias_pct, avg_abs_dev, direction_correct_rate, total_sample, n_reviews}"""
+    w_bias = s_bias = w_dev = s_dev = w_rate = s_rate = 0.0
+    for i, rec in enumerate(history):
+        rank = len(history) - i                      # 最新 rank=1
+        w = (rec.get("reviewed") or 0) * (ROLLING_DECAY ** (rank - 1))
+        if rec.get("bias_pct") is not None:
+            w_bias += w
+            s_bias += rec["bias_pct"] * w
+        if rec.get("avg_abs_dev") is not None:
+            w_dev += w
+            s_dev += rec["avg_abs_dev"] * w
+        if rec.get("direction_correct_rate") is not None:
+            w_rate += w
+            s_rate += rec["direction_correct_rate"] * w
+    return {
+        "bias_pct": round(s_bias / w_bias, 2) if w_bias else None,
+        "avg_abs_dev": round(s_dev / w_dev, 2) if w_dev else None,
+        "direction_correct_rate": round(s_rate / w_rate, 1) if w_rate else None,
+        "total_sample": sum(r.get("reviewed") or 0 for r in history),
+        "n_reviews": len(history),
+    }
+
+
+def build_prediction_review_context():
+    """把预测复盘结论（方向准确率 + 幅度偏差率 + 经验教训）拼成文本，喂回下次分析（形成闭环）
+
+    幅度偏差率 bias_pct 只统计方向判对的样本：+ 表示系统性低估（实际比预测高），
+    下次预测预期涨幅应尽量加上该修正值；方向准确率低时 AI 应降低方向判断的信心。
+    """
+    data = load_prediction_lessons()
+    stats = data.get("stats") or {}
+    if not stats:
+        return None
+    bias = stats.get("bias_pct")
+    bias_txt = f"{bias:+.2f}%" if bias is not None else "-"
+    if bias is not None:
+        if bias > 0.05:
+            bias_advice = "历史方向判对时实际涨幅普遍高于预测，本次预期涨幅应相应上调（加偏差修正值）"
+        elif bias < -0.05:
+            bias_advice = "历史方向判对时实际涨幅普遍低于预测，本次预期涨幅应相应下调（减偏差修正值）"
+        else:
+            bias_advice = "历史幅度基本准确，保持常规预测"
+    else:
+        bias_advice = "暂无方向判对样本，幅度修正无参考"
+    rate = stats.get("direction_correct_rate")
+    lines = [
+        f"你的历史预测复盘（{data.get('updated', '-')}）：共 {stats.get('reviewed', 0)} 只，"
+        f"方向正确率 {rate if rate is not None else '-'}%（方向误判较多时应调低本次涨跌方向的把握）",
+        f"幅度偏差率（仅方向判对的样本，实际-预测均值）= {bias_txt} → {bias_advice}；"
+        f"平均绝对偏差 {stats.get('avg_abs_dev', '-')}%，"
+        f"高估 {stats.get('over_estimate', 0)} 只 / 低估 {stats.get('under_estimate', 0)} 只",
+    ]
+    # 滚动加权修正值（近 N 次复盘，样本更稳）：作为本次预测的主要修正依据
+    rolling = data.get("rolling") or {}
+    if rolling.get("n_reviews"):
+        rb = rolling.get("bias_pct")
+        rb_txt = f"{rb:+.2f}%" if rb is not None else "-"
+        if rb is not None and abs(rb) > 0.05:
+            rb_advice = "近期系统性低估，保持上调修正" if rb > 0 else "近期系统性高估，保持下调修正"
+        else:
+            rb_advice = "近期幅度基本稳定，常规预测即可"
+        lines.append(
+            f"滚动修正（近 {rolling.get('n_reviews')} 次复盘、共 {rolling.get('total_sample')} 只样本）："
+            f"加权偏差率 {rb_txt} → {rb_advice}；加权方向正确率 {rolling.get('direction_correct_rate', '-')}%，"
+            f"加权平均绝对偏差 {rolling.get('avg_abs_dev', '-')}%（样本量越大越可信）")
+    # 基准对照：AI 是否真的强于简单策略（动量跟涨/均值回归/历史频率/随机）
+    bl = stats.get("baselines") or {}
+    if bl.get("sample"):
+        exc = bl.get("excess_vs_best")
+        exc_txt = f"{exc:+.1f}pp" if exc is not None else "-"
+        lines.append(
+            f"基准对照（样本 {bl.get('sample')}）：你（AI）方向正确率 {bl.get('ai_rate')}% vs "
+            f"动量跟涨 {bl.get('momentum_rate')}% / 均值回归 {bl.get('reversal_rate')}% / "
+            f"历史频率 {bl.get('base_rate')}% / 随机 {bl.get('random_rate')}%，"
+            f"超额（超过最佳基线）{exc_txt}；AI 幅度平均绝对偏差 {bl.get('ai_abs_dev')}% vs "
+            f"动量跟涨 {bl.get('momentum_abs_dev')}%")
+    # 信心校准：各档位实际正确率，高档位不可靠时应降低高信心判断
+    calib = data.get("confidence_calibration") or []
+    if calib:
+        calib_txt = "；".join(
+            f"{c.get('level','?')}信心 {c.get('direction_correct_rate','-')}%（样本{c.get('sample',0)}）"
+            for c in calib)
+        lines.append(f"信心校准（各档位实际方向正确率）：{calib_txt}"
+                     f"（若高信心不高于低信心，说明信心不可靠，应降低高信心档位的把握）")
+    lessons = data.get("lessons") or []
+    if lessons:
+        lines.append("预测经验教训：" + "；".join(lessons))
+    return "\n".join(lines)
