@@ -1,0 +1,9 @@
+# 基金监控 · 源码运行依赖
+# 注意：pywebview 必须锁 5.4（6.x 有 window.native 递归 bug → 启动慢/卡死）
+pywebview==5.4
+requests
+openai
+pythonnet
+
+# 打包 exe 才需要（PyInstaller 单文件模式）
+pyinstaller
