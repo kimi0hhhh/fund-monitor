@@ -1999,10 +1999,8 @@ tbody tr:last-child td{border-bottom:none}
     <input id="m_amt" placeholder="金额（元）" onkeydown="if(event.key==='Enter')saveModal()">
     <input id="m_amt2" placeholder="累计收益（元）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
     <input id="m_proxy" placeholder="代理地址（可选）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
-    <select id="m_model" style="display:none">
-      <option value="deepseek-v4-pro">DeepSeek V4-Pro · 深度推理（推荐）</option>
-      <option value="deepseek-v4-flash">DeepSeek V4-Flash · 更快更省</option>
-    </select>
+    <input id="m_base_url" placeholder="API 地址（如 https://tokenhub.tencentmaas.com/v1）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
+    <input id="m_model" placeholder="模型名称（如 deepseek-v4-pro）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
     <div class="row">
       <button class="cancel" onclick="closeModal()">取消</button>
       <button class="ok" onclick="saveModal()">确认</button>
@@ -2311,6 +2309,7 @@ function openModal(mode){
   inp2.style.display='none';
   document.getElementById('m_proxy').style.display='none';
   document.getElementById('m_model').style.display='none';
+  document.getElementById('m_base_url').style.display='none';
   inp.style.display='block';
   inp.dataset.mode='';
   if(mode==='delete'){
@@ -2343,9 +2342,10 @@ async function saveModal(){
   if(inp && inp.dataset && inp.dataset.mode==='settings'){
     const key = inp.value.trim();
     if(!key){ toast('API key 不能为空', true); return; }
-    const model = document.getElementById('m_model').value;
+    const model = (document.getElementById('m_model').value||'').trim() || 'deepseek-v4-pro';
+    const base_url = (document.getElementById('m_base_url').value||'').trim() || '';
     const proxy = (document.getElementById('m_proxy').value||'').trim();
-    const r = await pywebview.api.save_analysis_config(key, model);
+    const r = await pywebview.api.save_analysis_config(key, model, base_url);
     const r2 = await pywebview.api.save_proxy_config(proxy);
     closeModal();
     toast((r.ok&&r2.ok)?'设置已保存':'保存失败', (r.ok&&r2.ok)?false:true);
@@ -2549,6 +2549,7 @@ function clearSignals(){
   document.getElementById('m_amt').dataset.mode='';
   document.getElementById('m_amt2').style.display='none';
   document.getElementById('m_model').style.display='none';
+  document.getElementById('m_base_url').style.display='none';
   modalMode='clear-signals';
   document.getElementById('mask').classList.add('show');
 }
@@ -2770,7 +2771,7 @@ function openSettings(){
   pywebview.api.get_analysis_config().then(r=>{
     const cfg = r.config || {};
     document.getElementById('m_title').textContent='分析设置（LLM API + 代理）';
-    document.getElementById('m_desc').textContent='填入 API key 并选择模型；行情/接口访问异常时，可在此填代理地址（如 10.110.32.68:7897）。';
+    document.getElementById('m_desc').textContent='填入 API 地址、Key、模型名称；行情/接口异常时可填代理地址。支持任意 OpenAI 兼容 API。';
     const inp = document.getElementById('m_amt');
     document.getElementById('m_amt2').style.display='none';
     const prx = document.getElementById('m_proxy');
@@ -2780,9 +2781,16 @@ function openSettings(){
       if(r2 && r2.ok && r2.proxy) prx.value = r2.proxy;
     });
     prx.placeholder = '代理地址（可选，如 10.110.32.68:7897，留空清除）';
-    const sel = document.getElementById('m_model');
-    sel.style.display='block';
-    sel.value = (cfg.model==='deepseek-v4-flash') ? 'deepseek-v4-flash' : 'deepseek-v4-pro';
+    // API 地址
+    const urlInput = document.getElementById('m_base_url');
+    urlInput.style.display='block';
+    urlInput.value = cfg.base_url || '';
+    urlInput.placeholder = 'API 地址（如 https://tokenhub.tencentmaas.com/v1）';
+    // 模型名称
+    const modelInput = document.getElementById('m_model');
+    modelInput.style.display='block';
+    modelInput.value = cfg.model || 'deepseek-v4-pro';
+    modelInput.placeholder = '模型名称（如 deepseek-v4-pro）';
     inp.value = cfg.api_key || '';
     inp.placeholder = 'API Key';
     inp.type = 'text';
@@ -2799,6 +2807,7 @@ function editIdleCash(){
   document.getElementById('m_amt2').style.display='none';
   document.getElementById('m_proxy').style.display='none';
   document.getElementById('m_model').style.display='none';
+  document.getElementById('m_base_url').style.display='none';
   inp.value = (state && state.idle_cash) ? state.idle_cash : '';
   inp.placeholder = '闲钱金额（元）';
   inp.type = 'text';
