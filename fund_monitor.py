@@ -17,6 +17,13 @@ import requests
 import webview
 
 try:
+    import pystray
+    from PIL import Image
+    _HAS_TRAY = True
+except Exception:
+    _HAS_TRAY = False  # 缺 pystray 时降级：无托盘，关闭=退出
+
+try:
     import fund_analysis as fa
 except Exception:
     fa = None  # 缺依赖时降级，UI 调用处会友好提示
@@ -65,9 +72,22 @@ def _get_proxies():
 
 
 # ---------- UI 偏好配置（收起态/隐藏金额/开机自启） ----------
+def _single_instance_check():
+    """单实例锁：已有一个实例在运行时，新实例直接退出（托盘常驻后重复双击 exe 会多开，窗口互相干扰）"""
+    try:
+        import ctypes
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "FundMonitor_SingleInstance_Mutex")
+        err = ctypes.windll.kernel32.GetLastError()
+        if err == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        return True
+    except Exception:
+        return True
+
+
 def load_ui_config():
-    """读取 UI 偏好：collapsed(悬浮窗默认收起)、mask(默认隐藏金额)、autostart(开机自启)"""
-    default = {"collapsed": True, "mask": True, "autostart": False}
+    """读取 UI 偏好：collapsed(悬浮窗是否收起)、mask(默认隐藏金额)、autostart(开机自启)"""
+    default = {"collapsed": False, "mask": True, "autostart": False}
     try:
         with open(UI_CONFIG_FILE, "r", encoding="utf-8") as f:
             return {**default, **json.load(f)}
@@ -249,6 +269,52 @@ def _set_topmost(win, top):
         return True
     except Exception:
         return False
+
+
+def _tray_icon_image():
+    """加载托盘图标（app.ico → PIL Image，32x32）"""
+    from PIL import Image as _PILImage
+    path = ICON_FILE
+    if not os.path.exists(path):
+        # PyInstaller 打包后 app.ico 在 _MEIPASS 里
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            p2 = os.path.join(meipass, "app.ico")
+            if os.path.exists(p2):
+                path = p2
+    img = _PILImage.open(path)
+    img = img.resize((32, 32), _PILImage.LANCZOS)
+    return img
+
+
+def _create_tray(api):
+    """创建系统托盘图标：
+       - 左键单击 → 显示/隐藏主窗口
+       - 右键菜单 → 显示主窗口 / 显示悬浮窗 / 彻底退出
+    """
+    def _show_main():
+        api.show_main()
+        try:
+            api._main_window.show()
+            api._main_visible = True
+        except Exception:
+            pass
+
+    def _show_float():
+        api.show_floating()
+
+    def _quit():
+        api.quit_app()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("显示主窗口", lambda icon, item: _show_main()),
+        pystray.MenuItem("显示悬浮窗", lambda icon, item: _show_float()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("彻底退出", lambda icon, item: _quit()),
+    )
+    icon = pystray.Icon("fund_monitor", _tray_icon_image(), "基金监控", menu)
+    icon.run_detached()  # 独立线程运行，不阻塞 webview 主循环
+    return icon
 
 
 def _qdate(s):
@@ -509,6 +575,11 @@ def fetch_batch(codes):
     except Exception:
         pass
 
+    # 盘中估值兜底只在交易时段（开市日 9:30-15:00）使用；
+    # 收盘后/盘前/周末直接用腾讯官方净值(p[5])与官方涨跌(p[7])，避免估算覆盖官方数据导致不准
+    _now = datetime.now()
+    _in_trading = (_now.weekday() < 5
+                   and 9 * 60 + 30 <= _now.hour * 60 + _now.minute <= 15 * 60)
     for code in codes:
         base = result.get(code)
         if base is None:
@@ -532,6 +603,8 @@ def fetch_batch(codes):
             except Exception:
                 pass
             continue
+        if not _in_trading:
+            continue   # 收盘后/盘前/周末：保留腾讯官方数据，不走估值兜底
         try:
             est = _fetch_estimate(code, base)
             if est:
@@ -591,12 +664,15 @@ class Api:
         self._windows = []
         self._main_window = None
         self._float_window = None
+        self._tray = None
+        self._quitting = False
+        self._main_visible = True
         self._refreshed = False
         self._tasks = {}  # 分析任务池：task_id -> {status, progress, msg, result}
         self._review_summary = None  # 收盘后复盘的汇总缓存
         self._state_lock = threading.RLock()  # 保护 data/info 读写，避免加载中并发渲染错乱
         _ui = load_ui_config()
-        self._float_collapsed = bool(_ui.get("collapsed", True))  # 悬浮窗默认收起
+        self._float_collapsed = False  # 悬浮窗固定展开（已彻底移除收起功能）
         self._float_on_top = True  # 悬浮窗是否置顶
         self._mask_amount = bool(_ui.get("mask", True))  # 默认隐藏金额（总资产/闲钱打码）
         self.idle_cash = load_idle_cash()  # 闲钱（可用于加减仓的闲置资金）
@@ -649,7 +725,8 @@ class Api:
                 fc = pf["portfolio_forecast"]
                 portfolio_pred = {"direction": fc.get("direction"),
                                   "expected_pct": fc.get("expected_pct"),
-                                  "confidence": fc.get("confidence")}
+                                  "confidence": fc.get("confidence"),
+                                  "forecast_date": pf.get("forecast_date")}
         for code in sorted(self.data.keys()):
             d = self.data[code]
             info = self.info.get(code, {})
@@ -690,10 +767,12 @@ class Api:
             if pred and pred.get("tomorrow_forecast"):
                 tom = pred["tomorrow_forecast"]
                 today_pred = {"direction": tom.get("direction"),
-                              "expected_pct": tom.get("expected_pct")}
+                              "expected_pct": tom.get("expected_pct"),
+                              "forecast_date": pred.get("forecast_date")}
             funds.append({
                 "code": code, "name": name, "pct": pct,
                 "value": value or None,
+                "has_nav": bool(gz),
                 "ratio": round(value / holdings * 100, 1) if holdings and value else 0.0,
                 "profit": pf,
                 "realized": cum,
@@ -708,7 +787,13 @@ class Api:
                 "confirm_days": int(d.get("confirm_days", 1)),
                 "today_pred": today_pred,
             })
-        total += self.idle_cash  # 总资产 = 持仓市值 + 闲钱
+        ready = all(f["has_nav"] for f in funds)
+        if ready:
+            total += self.idle_cash  # 总资产 = 持仓市值 + 闲钱
+        else:
+            # 有基金未拿到净值（启动加载中/估值失败）：总额显示未知，
+            # 不输出 0 总资产 / 负累计收益的假数据
+            total = profit = realized = None
         return {
             "funds": funds,
             "total": total,
@@ -723,7 +808,6 @@ class Api:
             "idle_cash": self.idle_cash,
             "rate_points": self._rate_history.get(datetime.now().strftime("%Y-%m-%d"), []),
             "mask": self._mask_amount,
-            "collapsed": self._float_collapsed,
         }
 
     def add_fund(self, code, amount, confirm_days=1):
@@ -1073,16 +1157,22 @@ class Api:
         return {"ok": True}
 
     def show_floating(self):
-        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（按保存的偏好恢复收起/展开）"""
-        if self._float_window:
+        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（固定展开，不缩成条）"""
+        if not self._float_window:
+            return {"ok": False, "msg": "无悬浮窗"}
+        try:
+            self._main_window.hide()
+            self._float_window.show()
+            self._main_visible = False
+        except Exception as e:
+            print("show_floating 异常:", e)
+            # 悬浮窗失败时恢复主窗口，避免用户什么都看不到
             try:
-                self._main_window.hide()
-                self._float_window.show()
-                # 若保存的是收起态，确保窗口尺寸/位置为收起状态
-                if self._float_collapsed:
-                    self._apply_float_size()
+                self._main_window.show()
+                self._main_visible = True
             except Exception:
                 pass
+            return {"ok": False, "msg": str(e)[:80]}
         return {"ok": True}
 
     def show_main(self):
@@ -1091,9 +1181,49 @@ class Api:
             try:
                 self._float_window.hide()
                 self._main_window.show()
+                self._main_visible = True
             except Exception:
                 pass
         return {"ok": True}
+
+    def hide_to_tray(self):
+        """关闭按钮 → 隐藏到系统托盘（程序继续后台常驻，不退出）"""
+        try:
+            self._main_window.hide()
+        except Exception:
+            pass
+        try:
+            self._float_window.hide()
+        except Exception:
+            pass
+        self._main_visible = False
+        self._ensure_tray()
+        return {"ok": True}
+
+    def toggle_main_visible(self):
+        """托盘左键/菜单：显示或隐藏主窗口"""
+        if self._main_visible:
+            self.hide_to_tray()
+        else:
+            try:
+                self._float_window.hide()
+            except Exception:
+                pass
+            self._main_window.show()
+            self._main_visible = True
+        return {"ok": True}
+
+    def _ensure_tray(self):
+        """确保系统托盘图标存在（首次调用时创建）"""
+        if self._tray is not None:
+            return
+        if not _HAS_TRAY:
+            return
+        try:
+            self._tray = _create_tray(self)
+        except Exception as e:
+            print("托盘创建失败:", e)
+            self._tray = None
 
     def toggle_mask_amount(self):
         """切换金额隐藏（总资产/闲钱打码，悬浮窗同步），偏好持久化"""
@@ -1118,13 +1248,19 @@ class Api:
         return {
             "ok": True,
             "mask": self._mask_amount,
-            "collapsed": self._float_collapsed,
             "autostart": _autostart_enabled(),
         }
 
     def quit_app(self):
-        """退出应用"""
+        """退出应用（托盘右键「彻底退出」/ 悬浮窗不再直接退出）"""
         import os as _os
+        self._quitting = True
+        try:
+            if self._tray is not None:
+                self._tray.stop()
+                self._tray = None
+        except Exception:
+            pass
         try:
             for w in self._windows:
                 w.destroy()
@@ -1146,41 +1282,8 @@ class Api:
             return {"ok": False, "msg": str(e)[:80]}
 
     def toggle_collapse(self):
-        """收起/展开悬浮窗：收起时缩成小条贴屏幕右下角，展开恢复"""
-        w = self._float_window
-        if not w:
-            return {"ok": False, "msg": "无悬浮窗"}
-        try:
-            self._float_collapsed = not self._float_collapsed
-            self._apply_float_size()
-            # 偏好持久化
-            cfg = load_ui_config()
-            cfg["collapsed"] = self._float_collapsed
-            save_ui_config(cfg)
-            return {"ok": True, "collapsed": self._float_collapsed}
-        except Exception as e:
-            self._float_collapsed = not self._float_collapsed
-            return {"ok": False, "msg": str(e)[:80]}
-
-    def _apply_float_size(self):
-        """按当前收起/展开状态设置悬浮窗尺寸与位置（工作区内，避开任务栏）"""
-        w = self._float_window
-        if not w:
-            return
-        if self._float_collapsed:
-            cw, ch = 260, 72
-        else:
-            cw, ch = 320, 460
-        w.resize(cw, ch)
-        # 用排除任务栏后的可用区域定位，避免收起窗口压在底部任务栏上
-        # （之前用整屏高度，窗口底部落在任务栏内，展开按钮被挡，表现为"缩进隐藏图标"）
-        wax, way, waw, wah = _work_area()
-        margin = 14
-        x = max(wax, wax + waw - cw - margin)
-        y = max(way, way + wah - ch - margin)
-        w.move(x, y)
-        # resize/move 后重新置顶，避免丢失 z-order 被其他窗口盖住
-        _set_topmost(w, self._float_on_top)
+        """已移除收起功能：悬浮窗固定展开，此方法保留兼容返回 False 状态"""
+        return {"ok": True, "collapsed": False}
 
     # ---------- 分析模式 API ----------
     def get_analysis_config(self):
@@ -1245,16 +1348,22 @@ class Api:
                     self._tasks[task_id] = {
                         "status": "running", "progress": pct_v, "msg": msg}
 
+                trade_ctx = fa.build_trade_review_context()
+                pred_ctx = fa.build_prediction_review_context()
                 result = fa.analyze_fund(
                     code, name, amount, shares, gz, pct, progress_cb=progress,
                     signal_context=self._get_signal_context(code),
-                    trade_review_context=fa.build_trade_review_context())
+                    trade_review_context=trade_ctx,
+                    prediction_review_context=pred_ctx)
                 self._tasks[task_id] = {
                     "status": "done" if result.get("ok") else "error",
                     "progress": 100,
                     "result": result,
                 }
                 if result.get("ok"):
+                    # 复盘联动：把喂给 AI 的复盘经验带回前端展示（结论依据来源）
+                    result["review_context"] = {"trade": trade_ctx, "prediction": pred_ctx}
+                    result["report"]["forecast_date"] = fa.compute_forecast_date()
                     today = datetime.now().strftime("%Y-%m-%d")
                     fa.save_prediction(today, code, result["report"])
                     fa.save_report(today, code, result.get("raw", ""))
@@ -1327,9 +1436,12 @@ class Api:
                     r = fa.analyze_fund(code, name, amount, shares, gz, pct,
                                         progress_cb=progress,
                                         signal_context=self._get_signal_context(code),
-                                        trade_review_context=fa.build_trade_review_context())
+                                        trade_review_context=fa.build_trade_review_context(),
+                                        prediction_review_context=fa.build_prediction_review_context())
                     results.append(r)
                     if r.get("ok"):
+                        r["review_context"] = {"trade": None, "prediction": None}  # 组合层统一展示
+                        r["report"]["forecast_date"] = fa.compute_forecast_date()
                         fa.save_prediction(today, code, r["report"])
                         fa.save_report(today, code, r.get("raw", ""))
                         fa.add_signals_from_report(code, r["report"])
@@ -1354,10 +1466,14 @@ class Api:
 
             self._tasks[task_id] = {"status": "running", "progress": 75,
                                     "msg": "AI 组合策略师分析中（含闲钱 + 新方向）..."}
+            combo_trade_ctx = fa.build_trade_review_context()
+            combo_pred_ctx = fa.build_prediction_review_context()
             portfolio_result = fa.analyze_portfolio(funds, self.idle_cash,
                                                     signal_contexts=sig_ctxs or None,
-                                                    trade_review_context=fa.build_trade_review_context())
+                                                    trade_review_context=combo_trade_ctx,
+                                                    prediction_review_context=combo_pred_ctx)
             if portfolio_result.get("ok"):
+                portfolio_result["report"]["forecast_date"] = fa.compute_forecast_date()
                 fa.save_portfolio_prediction(today, portfolio_result["report"])
 
             # 量化配置模型（风险平价简化版）
@@ -1384,6 +1500,7 @@ class Api:
                            "results": results, "ok_count": ok_count,
                            "total": total,
                            "signal_summary": sig_summary,
+                           "review_context": {"trade": combo_trade_ctx, "prediction": combo_pred_ctx},
                            "analyzed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1393,9 +1510,10 @@ class Api:
         return self._tasks.get(task_id, {"status": "unknown"})
 
     def list_history_dates(self):
+        """返回所有预测目标日（对哪天的预测），倒序，供复盘/历史按目标日选择"""
         if fa is None:
             return []
-        return fa.list_history_dates()
+        return fa.list_forecast_dates()
 
     def get_history_record(self, date_str, code):
         if fa is None:
@@ -1436,26 +1554,29 @@ class Api:
             "analyzed_at": today,
         }
 
-    def get_history_full(self, date_str):
-        """返回某天的完整预测（组合 + 每只基金）"""
+    def get_history_full(self, fd):
+        """返回对某目标日的完整预测（组合 + 每只基金，跨分析日聚合，取最新分析日）"""
         if fa is None:
             return None
-        h = fa.get_history(date_str)
-        if not h:
-            return None
-        # 补充基金名称
-        predictions = h.get("predictions", {})
+        h = fa.get_history() or {}
         items = []
-        for code, pred in predictions.items():
-            d = self.data.get(code, {})
-            items.append({
-                "code": code,
-                "name": d.get("name") or code,
-                "report": pred,
-            })
+        portfolio = None
+        seen = set()
+        for dstr in sorted(h.keys(), reverse=True):
+            day = h[dstr] or {}
+            for code, pred in (day.get("predictions") or {}).items():
+                if fa._fd_of(pred, dstr) == fd and code not in seen:
+                    seen.add(code)
+                    d = self.data.get(code, {})
+                    items.append({"code": code, "name": d.get("name") or code, "report": pred})
+            pf_rec = day.get("portfolio")
+            if pf_rec and fa._fd_of(pf_rec, dstr) == fd and portfolio is None:
+                portfolio = pf_rec
+        if not items and not portfolio:
+            return None
         return {
-            "date": date_str,
-            "portfolio": h.get("portfolio"),
+            "date": fd,
+            "portfolio": portfolio,
             "items": items,
         }
 
@@ -1525,10 +1646,12 @@ class Api:
                 "today": datetime.now().strftime("%Y-%m-%d")}
 
     def review_trade_reviews(self):
-        """AI 复盘所有待复盘的加减仓建议：如果当时听从了建议会盈利还是亏损
+        """AI 复盘待复盘的加减仓建议：如果当时听从了建议会盈利还是亏损
 
-        只在开市日收盘后（23:00 后，等基金当日净值更新完）复盘：休市日不复盘（净值未更新），
-        盘中不复盘（当日净值未定盘），且只复盘建议日期早于今天的。
+        锚点：23:00 只复盘「对今天（forecast_date=今日）」的加减仓建议——
+        即昨天收盘后/今天盘中给出的、目标日是今天的建议（"昨天对今天的建议复盘"）。
+        只在开市日 23:00 后复盘（等当日净值更新完）；休市日不复盘。
+        旧数据无 forecast_date 的，fallback 按生成日 < 今天（原逻辑）。
         """
         if fa is None:
             return {"ok": False, "msg": "模块未加载"}
@@ -1540,13 +1663,22 @@ class Api:
             return {"ok": False, "msg": "基金当日净值尚未更新完，复盘将在 23:00 后自动进行"}
         reviews = fa.load_trade_reviews()
         today = datetime.now().strftime("%Y-%m-%d")
+
+        def _due(r):
+            fd = str(r.get("forecast_date") or "").strip()
+            if fd:
+                return fd <= today          # 对今天及以前的建议（今天复盘"对今天"+补历史漏网）
+            return str(r.get("date", "")) < today  # 旧数据：生成日早于今天
+
         pending = [r for r in reviews
-                   if r.get("status") == "pending" and str(r.get("date", "")) < today]
+                   if r.get("status") == "pending" and _due(r)]
         if not pending:
-            has_today = any(r.get("status") == "pending"
-                            and str(r.get("date", "")) == today for r in reviews)
-            if has_today:
-                return {"ok": False, "msg": "今天的加减仓建议需等下一开市日收盘后才能复盘"}
+            future = [r for r in reviews
+                      if r.get("status") == "pending"
+                      and str(r.get("forecast_date") or r.get("date", "")) > today]
+            if future:
+                fd = future[0].get("forecast_date") or future[0].get("date")
+                return {"ok": False, "msg": f"对 {fd} 的加减仓建议需等该日收盘后自动复盘"}
             return {"ok": False, "msg": "没有待复盘的加减仓建议"}
         task_id = uuid.uuid4().hex[:8]
         self._tasks[task_id] = {"status": "running", "progress": 0,
@@ -1565,6 +1697,16 @@ class Api:
                     try:
                         info = fetch_batch([code]).get(code)
                         if info:
+                            # T+N 净值新鲜度校验：当前行情净值日期必须 ≥ 建议目标日，
+                            # 否则（QDII 等净值滞后 1-2 天）跳过，避免用旧净值算出错误盈亏
+                            fd = str(r.get("forecast_date") or r.get("date", "")).strip()
+                            qd = str(info.get("qdate") or "").strip()
+                            if fd and qd and qd < fd:
+                                results.append({"id": r.get("id", ""), "name": r.get("name", ""),
+                                                "result": "净值未更新",
+                                                "pnl_pct": None,
+                                                "note": f"当前净值日期 {qd} 早于目标日 {fd}（T+N 滞后），待更新后自动复盘"})
+                                continue
                             quote = f"{info.get('name','')} 净值 {info.get('gz')} 今日 {info.get('gz_pct')}%"
                     except Exception:
                         pass
@@ -1651,8 +1793,8 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "task_id": task_id}
 
-    def review_all(self, date_str):
-        """异步批量复盘：组合预测 + 全部持仓预测（按日期一起复盘）"""
+    def review_all(self, fd):
+        """异步按目标日复盘：对 fd 的预测（跨分析日聚合）+ 组合预测（对 fd 的最近一份）"""
         if fa is None:
             return {"ok": False, "msg": "fund_analysis 模块未加载"}
         task_id = uuid.uuid4().hex[:8]
@@ -1660,16 +1802,22 @@ class Api:
 
         def worker():
             try:
-                result = fa.review_all_predictions(date_str)
+                result = fa.review_all_predictions(fd)
                 if result.get("ok"):
                     # 补充基金名称
                     for r in result["results"]:
                         d = self.data.get(r.get("code"), {})
                         r["name"] = d.get("name") or r.get("code")
 
-                    # 组合复盘：计算组合实际涨跌（持仓市值加权）
-                    hist = fa.get_history(date_str)
-                    if hist and hist.get("portfolio"):
+                    # 组合复盘：取最近一份「对 fd 的组合预测」，对比 fd 当天持仓市值加权实际
+                    combo_pred = None
+                    hist_all = fa.get_history() or {}
+                    for dstr in sorted(hist_all.keys(), reverse=True):
+                        pf_rec = hist_all[dstr].get("portfolio")
+                        if pf_rec and fa._fd_of(pf_rec, dstr) == fd:
+                            combo_pred = pf_rec
+                            break
+                    if combo_pred:
                         total_val, weighted = 0.0, 0.0
                         for code, d in self.data.items():
                             gz = (self.info.get(code, {}) or {}).get("gz")
@@ -1678,19 +1826,23 @@ class Api:
                             if value <= 0:
                                 continue
                             h = fa.fetch_history(code, 60)
-                            pct, _ = fa.find_next_pct(h, date_str)
+                            pct = next((x.get("pct") for x in h if x.get("date") == fd), None)
                             if pct is not None:
                                 total_val += value
                                 weighted += value * pct
                         if total_val > 0:
                             combo_pct = round(weighted / total_val, 4)
                             result["portfolio_review"] = fa.review_portfolio(
-                                date_str, combo_pct)
+                                combo_pred, combo_pct, fd)
 
                     # 配置了 LLM 则总结整体偏差原因
                     self._tasks[task_id] = {"status": "running", "progress": 80,
                                             "msg": "AI 分析偏差原因..."}
-                    result["deviation_reason"] = fa.summarize_review(date_str, result)
+                    result["deviation_reason"] = fa.summarize_review(fd, result)
+                    # 预测复盘闭环：提炼方向+幅度经验教训，缓存喂给下次分析
+                    self._tasks[task_id] = {"status": "running", "progress": 90,
+                                            "msg": "提炼预测经验教训..."}
+                    fa.summarize_prediction_lessons(fd, result)
                 self._tasks[task_id] = {
                     "status": "done" if result.get("ok") else "error",
                     "progress": 100, "result": result}
@@ -2117,9 +2269,9 @@ tbody tr:last-child td{border-bottom:none}
 
     <div id="ana-pane-review" style="display:none">
       <div class="ana-bar">
-        <label>选择预测日期：</label>
+        <label>选择预测目标日：</label>
         <select id="rev_date"></select>
-        <button class="btn btn-add" onclick="doReviewAll()" style="background:linear-gradient(135deg,var(--down),var(--down))">📋 复盘当天全部</button>
+        <button class="btn btn-add" onclick="doReviewAll()" style="background:linear-gradient(135deg,var(--down),var(--down))">📋 复盘对所选日的全部预测</button>
       </div>
       <div id="rev-progress" style="display:none" class="ana-progress">
         <div class="bar-bg"><div id="rev-bar" class="bar-fg" style="width:0%"></div></div>
@@ -2231,6 +2383,14 @@ function updateSortHeader(){
 }
 function fmt(v,d=2){return v==null?'--':Number(v).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d})}
 function sgn(v,d=2){return (v>0?'+':'')+fmt(v,d)}
+function fdTxt(fd){return fd?' <span style="color:var(--sub);font-size:11px">对'+String(fd).slice(5)+'</span>':''}
+function pctTag(f){
+  if(!f) return '';
+  if(f.est) return '<small class="stale">预估</small>';
+  const d=new Date();
+  const t=String(d.getFullYear())+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  return '<small class="stale">'+(f.qdate===t?'收盘':'昨日收盘')+'</small>';
+}
 
 function render(st){
   state=st;
@@ -2261,7 +2421,7 @@ function render(st){
   // 今日总体预测（组合层面）
   const pf=document.getElementById('pf-forecast');
   if(st.portfolio_pred){
-    pf.innerHTML='<span class="badge '+dirCls(st.portfolio_pred.direction)+'" style="font-size:14px;padding:3px 10px">'+esc(st.portfolio_pred.direction||'-')+'</span> '+esc(st.portfolio_pred.expected_pct||'-');
+    pf.innerHTML='<span class="badge '+dirCls(st.portfolio_pred.direction)+'" style="font-size:14px;padding:3px 10px">'+esc(st.portfolio_pred.direction||'-')+'</span> '+esc(st.portfolio_pred.expected_pct||'-')+fdTxt(st.portfolio_pred.forecast_date);
     pf.className='v '+dirCls(st.portfolio_pred.direction);
     document.getElementById('pf-detail').textContent='信心 '+esc(st.portfolio_pred.confidence||'-');
   }else{
@@ -2276,7 +2436,7 @@ function render(st){
     const rs=st.review_summary;
     accAvg.textContent=rs.avg_accuracy+'%';
     accAvg.className='v '+(rs.avg_accuracy>=80?'up':(rs.avg_accuracy>=50?'flat':'down'));
-    document.getElementById('acc-detail').textContent='复盘 '+rs.date+' · 方向对 '+rs.direction_correct+'/'+rs.total;
+    document.getElementById('acc-detail').textContent='复盘 对'+String(rs.date).slice(5)+'日 · 方向对 '+rs.direction_correct+'/'+rs.total;
   }else{
     accAvg.textContent='--';
     accAvg.className='v';
@@ -2322,12 +2482,12 @@ function render(st){
     tr.innerHTML=
       '<td>'+f.code+'</td>'+
       '<td>'+esc(f.name)+badge+cd+pb+'</td>'+
-      '<td class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+(f.est?'':'<small class="stale">'+(f.qdate?f.qdate.slice(5):'昨收')+'</small>')+'</td>'+
-      '<td>'+(f.today_pred?'<span class="badge '+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.direction||'')+'</span> '+esc(f.today_pred.expected_pct||''):'<span style="color:var(--sub)">--</span>')+'</td>'+
+      '<td class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+pctTag(f)+'</td>'+
+      '<td>'+(f.today_pred?'<span class="badge '+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.direction||'')+'</span> '+esc(f.today_pred.expected_pct||'')+fdTxt(f.today_pred.forecast_date):'<span style="color:var(--sub)">--</span>')+'</td>'+
       '<td>'+(f.value?fmt(f.value):'--')+'</td>'+
       '<td>'+ratioCell+'</td>'+
       '<td class="pct '+cls(f.profit)+'">'+(f.profit==null?'--':(f.value?sgn(f.profit):'--'))+'</td>'+
-      '<td class="pct '+cls(f.realized)+'">'+(f.realized?sgn(f.realized):'--')+'</td>'+
+      '<td class="pct '+cls(f.realized)+'">'+(f.has_nav&&f.realized?sgn(f.realized):'--')+'</td>'+
       '<td>'+(f.shares?fmt(f.shares,4):'--')+'</td>'+
       '<td>'+(f.gz?'<span style="color:var(--sub)">'+f.gz.toFixed(4)+'</span>':'--')+'</td>';
     tr.onclick=()=>{selCode=f.code;render(state)};
@@ -2652,7 +2812,7 @@ async function refreshSignals(){
   }
   let list=sigs.filter(s=>matchSig(s,sigFilter));
   if(!list.length){
-    const emptyTxt=(sigFilter==='ai')?'暂无审核记录。每次打开信号页会自动审核进行中的信号。'
+    const emptyTxt=(sigFilter==='ai')?'暂无审核记录。每次打开信号页会自动审核进行中的信号（5 小时内不重复）。'
       :(sigFilter==='all')?'暂无信号。每次分析后，AI 会提取可追踪的投资信号到这里，供持续验证。'
       :'暂无「'+sigFilter+'」状态的信号。';
     box.innerHTML=html+'<div class="empty-state">'+emptyTxt+'</div>';
@@ -2742,6 +2902,7 @@ async function doAuditSignals(){
       const changed=[];
       (res.results||[]).forEach(x=>{cnt[x.status]=(cnt[x.status]||0)+1;if(x.changed)changed.push(x.id);});
       const sum=Object.keys(cnt).map(k=>k+' '+cnt[k]).join(' · ');
+      localStorage.setItem('lastAutoAuditTs',String(Date.now()));
       toast('审核完成：'+sum);
       refreshSignals();
       if(changed.length) setTimeout(()=>flashChangedSignals(changed), 300);
@@ -2761,15 +2922,19 @@ async function doAuditSignals(){
   }
 }
 
-let lastAutoAudit=0;
+const AUDIT_INTERVAL=5*60*60*1000; // 自动审核节流：5 小时只自动审一次
+function getLastAuditTs(){
+  const v=parseInt(localStorage.getItem('lastAutoAuditTs')||'0',10);
+  return Number.isFinite(v)?v:0;
+}
 async function autoAuditSignals(){
-  // 打开信号页自动审核进行中的信号（无需按钮），60 秒内不重复触发
+  // 打开信号页自动审核进行中的信号（无需按钮），5 小时内不重复触发（重启后仍生效）
   const now=Date.now();
-  if(now-lastAutoAudit<60000) return;
+  if(now-getLastAuditTs()<AUDIT_INTERVAL) return;
   const r=await pywebview.api.get_signals();
   if(!r.ok) return;
   const actives=(r.signals||[]).filter(s=>['active','强化','弱化'].includes(s.status));
-  if(actives.length){ lastAutoAudit=now; auditSignals(); }
+  if(actives.length){ localStorage.setItem('lastAutoAuditTs',String(now)); auditSignals(); }
 }
 
 function flashChangedSignals(ids){
@@ -2802,11 +2967,11 @@ async function refreshTradeReviews(){
       lessons.map(x=>'<div style="font-size:12.5px;line-height:1.6;margin-bottom:3px">• '+esc(x)+'</div>').join('')+
       '</div>';
   }
-  // 日期筛选下拉：全部 + 去重日期倒序
+  // 日期筛选下拉：全部 + 去重目标日倒序（优先 forecast_date，旧数据回退 date）
   const sel=document.getElementById('tr-date-filter');
   if(sel){
     const cur=sel.value;
-    const dates=[...new Set((r.reviews||[]).map(x=>x.date).filter(Boolean))].sort().reverse();
+    const dates=[...new Set((r.reviews||[]).map(x=>x.forecast_date||x.date).filter(Boolean))].sort().reverse();
     sel.innerHTML='<option value="">全部日期</option>'+
       dates.map(d=>'<option value="'+d+'">'+d+'</option>').join('');
     if(dates.includes(cur)) sel.value=cur;
@@ -2819,7 +2984,7 @@ async function refreshTradeReviews(){
     else hint.textContent='';
   }
   const selDate=sel?sel.value:'';
-  const revs=(r.reviews||[]).filter(x=>!selDate||x.date===selDate);
+  const revs=(r.reviews||[]).filter(x=>!selDate||(x.forecast_date||x.date)===selDate);
   if(!revs.length){
     box.innerHTML=html+'<div class="empty-state">'+((r.reviews||[]).length?'该日期暂无加减仓建议':'暂无加减仓建议。每次分析后，AI 的非持有（加仓/减仓/买入/卖出）建议会自动收集到这里复盘。')+'</div>';
     return;
@@ -2844,7 +3009,7 @@ async function refreshTradeReviews(){
     }
     html+='<div class="sig-card" style="border-left:3px solid var(--'+(vCls==='up'?'up':(vCls==='down'?'down':'sub'))+')">'+
       '<div class="sig-head"><span class="badge '+vCls+'">'+vTxt+'</span><span class="sig-title">'+esc(rv.name||rv.code)+'</span>'+
-      '<span style="font-size:11px;color:var(--sub)">'+esc(rv.date||'')+'</span></div>'+
+      '<span style="font-size:11px;color:var(--sub)">'+esc(rv.date||'')+(rv.forecast_date?' · 对'+esc(rv.forecast_date.slice(5))+'日':'')+'</span></div>'+
       '<div class="sig-meta">'+esc(rv.position_change||'-')+' · 建议时净值 '+esc(rv.ref_nav!=null?rv.ref_nav:'-')+'</div>'+
       (rv.rationale?'<div class="sig-basis">理由：'+esc(rv.rationale)+'</div>':'')+
       reviewHtml+
@@ -3058,6 +3223,16 @@ function renderFullReport(result, container){
     </div>`;
   }
 
+  // ===== 复盘联动（本次组合分析参考的历史复盘数据与修正依据） =====
+  const rc = result.review_context || {};
+  const rcParts=[];
+  if(rc.trade) rcParts.push('<div class="k">🧾 加减仓复盘参考</div><div style="font-size:12px;color:var(--sub);line-height:1.7;white-space:pre-wrap">'+esc(rc.trade)+'</div>');
+  if(rc.prediction) rcParts.push('<div class="k">📈 预测复盘参考（偏差率修正依据）</div><div style="font-size:12px;color:var(--sub);line-height:1.7;white-space:pre-wrap">'+esc(rc.prediction)+'</div>');
+  if(rcParts.length){
+    html += '<div class="sec" style="border-left:3px solid var(--teal)"><div class="k">🧭 复盘联动（结论依据来源：本次分析已参考以下历史复盘数据）</div>'+
+      rcParts.join('')+'</div>';
+  }
+
   // ===== 组合分析 =====
   if(result.portfolio && result.portfolio.ok){
     const r = result.portfolio.report || {};
@@ -3100,7 +3275,7 @@ function renderFullReport(result, container){
     <div class="sec"><div class="k">板块分布</div><div class="v" style="font-weight:400">${esc(st.sector_distribution||'-')}</div></div>
     <div class="sec"><div class="k">集中度 / 分散化</div><div class="v" style="font-weight:400">${esc(st.concentration||'-')} · ${esc(st.diversification||'-')}</div></div>
     <div class="sec"><div class="k">整体风险评级</div><div class="v">${esc(st.risk_level||'-')}</div></div>
-    <div class="sec"><div class="k">整体明日预测</div><div class="v"><span class="badge ${dirCls(pf.direction)}">${esc(pf.direction||'-')}</span> ${esc(pf.expected_pct||'-')}（信心 ${esc(pf.confidence||'-')}）</div></div>
+    <div class="sec"><div class="k">整体明日预测</div><div class="v"><span class="badge ${dirCls(pf.direction)}">${esc(pf.direction||'-')}</span> ${esc(pf.expected_pct||'-')}（信心 ${esc(pf.confidence||'-')}）${fdTxt(pf.forecast_date||result.portfolio.report.forecast_date)}</div></div>
     <div class="sec"><div class="k">预测理由</div><div class="v" style="font-weight:400">${esc(pf.reason||'-')}</div></div>
     <div class="sec"><div class="k">板块调整建议</div><div class="role-grid">${adjRows||'<span class="ts">无</span>'}</div></div>
     <div class="sec"><div class="k">整体调仓建议</div><ul>${(r.rebalance_suggestions||[]).map(x=>'<li>'+esc(x)+'</li>').join('')||'<li>-</li>'}</ul></div>
@@ -3149,7 +3324,7 @@ function renderFullReport(result, container){
       <div class="row" style="margin:4px 0">
         <div class="item"><div class="k">操作</div><div class="v"><span class="badge ${verdictClass(act.verdict)}">${esc(normVerdict(act.verdict)||'-')}</span></div></div>
         <div class="item"><div class="k">加减仓</div><div class="v">${esc(act.position_change||'-')}</div></div>
-        <div class="item"><div class="k">明日</div><div class="v"><span class="badge ${cls(tom.direction)}">${esc(tom.direction||'-')}</span> ${esc(tom.expected_pct||'-')}</div></div>
+        <div class="item"><div class="k">明日</div><div class="v"><span class="badge ${cls(tom.direction)}">${esc(tom.direction||'-')}</span> ${esc(tom.expected_pct||'-')}${fdTxt(rep.forecast_date)}</div></div>
         <div class="item"><div class="k">信心</div><div class="v">${rep.confidence_score||0}/100</div></div>
       </div>
       <div class="v" style="font-weight:400;color:var(--sub)">${esc(rep.summary||'')}</div>
@@ -3193,10 +3368,20 @@ function renderReport(result, container, sigInfo){
     const rate=closed.length?Math.round(correct/closed.length*100):null;
     sigHtml='<div class="metrics" style="margin-bottom:10px">📡 信号联动：历史信号 '+sigInfo.length+' 条 · 已了结 '+closed.length+' · 胜率 '+(rate!=null?rate+'%':'--')+' · 本次分析已参考历史信号并计入可信度</div>';
   }
+  // 复盘联动：喂给 AI 的历史复盘经验（结论依据来源说明）
+  const rc = result.review_context || {};
+  let rcHtml='';
+  if(rc.trade || rc.prediction){
+    rcHtml='<div class="metrics" style="margin-bottom:10px;line-height:1.8">🧭 复盘联动（结论依据来源）'+
+      (rc.trade?'<div style="margin-top:4px">· 加减仓复盘：'+esc(rc.trade)+'</div>':'')+
+      (rc.prediction?'<div style="margin-top:4px">· 预测复盘（偏差率修正依据）：'+esc(rc.prediction)+'</div>':'')+
+      '</div>';
+  }
 
   container.innerHTML = `
     ${mHtml}
     ${sigHtml}
+    ${rcHtml}
     <h3>📌 核心结论</h3>
     <div class="v">${esc(r.summary||'')} <span class="badge ${verdictClass(act.verdict)}">${esc(normVerdict(act.verdict)||'')}</span> 信心 ${r.confidence_score||0}/100</div>
 
@@ -3209,7 +3394,7 @@ function renderReport(result, container, sigInfo){
     <div class="sec"><div class="k">风险提示</div><div class="v">${esc(today.risk_flag||'-')}</div></div>
     <div class="sec"><div class="k">一句话简评</div><div class="v" style="font-weight:400">${esc(today.one_liner||'-')}</div></div>
 
-    <h3>🔮 明日预测</h3>
+    <h3>🔮 明日预测${fdTxt(result.report.forecast_date)}</h3>
     <div class="row">
       <div class="item"><div class="k">方向</div><div class="v"><span class="badge ${cls(tom.direction)}">${esc(tom.direction||'-')}</span></div></div>
       <div class="item"><div class="k">预期涨跌</div><div class="v">${esc(tom.expected_pct||'-')}</div></div>
@@ -3251,8 +3436,8 @@ async function refreshHistoryList(){
   if(!list) return;
   const dates = await pywebview.api.list_history_dates();
   if(!dates.length){ list.innerHTML='<div class="empty-state">暂无历史预测，先做一次分析</div>'; return; }
-  list.innerHTML = '<div style="color:var(--sub);font-size:12px;padding:4px 0 10px">点击日期查看当日预测详情</div>' +
-    dates.map(d=>'<div class="h-item" onclick="showHistoryRecord(\''+d+'\')"><div>📅 '+d+'</div><div class="meta">查看预测 →</div></div>').join('');
+  list.innerHTML = '<div style="color:var(--sub);font-size:12px;padding:4px 0 10px">点击目标日查看「对当日」的全部预测详情（跨分析日聚合）</div>' +
+    dates.map(d=>'<div class="h-item" onclick="showHistoryRecord(\''+d+'\')"><div>📅 对 '+String(d).slice(5)+' 日的预测</div><div class="meta">查看 →</div></div>').join('');
 }
 
 async function showHistoryRecord(date){
@@ -3266,12 +3451,12 @@ async function showHistoryRecord(date){
 function renderHistoryDetail(rec){
   const cls = v => v==='UP'||v==='BUY'||v==='ADD' ? 'up' : (v==='DOWN'||v==='SELL'||v==='REDUCE' ? 'down' : 'flat');
   const dirCls = v => v==='UP' ? 'up' : (v==='DOWN' ? 'down' : 'flat');
-  let html = '<div style="font-weight:600;margin:10px 0 12px">📅 ' + esc(rec.date) + ' 的预测</div>';
+  let html = '<div style="font-weight:600;margin:10px 0 12px">📅 对 ' + esc(String(rec.date).slice(5)) + ' 日的预测（跨分析日聚合）</div>';
 
   if(rec.portfolio){
     const pf = (rec.portfolio.portfolio_forecast) || {};
     html += '<div class="sec" style="border:1px solid var(--brand);border-radius:10px;padding:12px 14px;margin-bottom:10px">' +
-      '<div style="color:var(--brand);font-weight:600;margin-bottom:6px">📊 组合预测</div>' +
+      '<div style="color:var(--brand);font-weight:600;margin-bottom:6px">📊 组合预测'+fdTxt(rec.portfolio.forecast_date)+'</div>' +
       '<div class="v"><span class="badge '+dirCls(pf.direction)+'">'+esc(pf.direction||'-')+'</span> '+esc(pf.expected_pct||'-')+'（信心 '+esc(pf.confidence||'-')+'）</div>' +
       (pf.reason ? '<div class="v" style="font-weight:400;color:var(--sub);margin-top:4px">'+esc(pf.reason)+'</div>' : '') +
       '</div>';
@@ -3285,7 +3470,7 @@ function renderHistoryDetail(rec){
       '<div style="font-weight:700;margin-bottom:4px">'+esc(it.code)+' '+esc(it.name)+'</div>' +
       '<div class="row" style="margin:4px 0">' +
         '<div class="item"><div class="k">操作</div><div class="v"><span class="badge '+cls(act.verdict)+'">'+esc(act.verdict||'-')+'</span></div></div>' +
-        '<div class="item"><div class="k">明日</div><div class="v"><span class="badge '+dirCls(tom.direction)+'">'+esc(tom.direction||'-')+'</span> '+esc(tom.expected_pct||'-')+'</div></div>' +
+        '<div class="item"><div class="k">明日</div><div class="v"><span class="badge '+dirCls(tom.direction)+'">'+esc(tom.direction||'-')+'</span> '+esc(tom.expected_pct||'-')+fdTxt(rep.forecast_date)+'</div></div>' +
         '<div class="item"><div class="k">信心</div><div class="v">'+(rep.confidence_score||0)+'/100</div></div>' +
       '</div>' +
       '<div class="v" style="font-weight:400;color:var(--sub)">'+esc(rep.summary||'')+'</div>' +
@@ -3298,7 +3483,7 @@ async function refreshReviewDates(){
   const sel = document.getElementById('rev_date');
   if(!sel) return;
   const dates = await pywebview.api.list_history_dates();
-  sel.innerHTML = dates.map(d=>'<option value="'+d+'">'+d+'</option>').join('');
+  sel.innerHTML = dates.map(d=>'<option value="'+d+'">对 '+String(d).slice(5)+' 日</option>').join('');
 }
 
 async function doReviewAll(){
@@ -3354,6 +3539,7 @@ function renderReviewAll(result, container){
         <div class="item"><div class="k">偏差</div><div class="v">${r.pct_deviation>0?'+':''}${r.pct_deviation}%</div></div>
         <div class="item"><div class="k">准确率</div><div class="v"><span class="badge ${accCls}">${r.accuracy}%</span></div></div>
       </div>
+      ${r.deviation_reason?'<div style="margin-top:6px;padding:8px 10px;background:var(--panel2);border-radius:8px;font-size:12.5px;line-height:1.6"><b>🤖 偏差原因：</b>'+esc(r.deviation_reason)+'</div>':''}
     </div>`;
   }).join('');
 
@@ -3373,17 +3559,60 @@ function renderReviewAll(result, container){
     </div>`;
   }
 
+  // 幅度偏差率：只算方向判对的样本（实际-预测均值），供下次预测作修正值
+  const okRows=(result.results||[]).filter(r=>r.ok);
+  const dirOk=okRows.filter(r=>r.direction_correct);
+  const biasVal=dirOk.length?dirOk.reduce((s,r)=>s+(r.pct_deviation||0),0)/dirOk.length:null;
+  const biasTxt=biasVal!=null?(biasVal>0?'+':'')+biasVal.toFixed(2)+'%':'--';
+  const biasHint=biasVal!=null?(biasVal>0.05?'系统性低估·下次预测应上调':(biasVal<-0.05?'系统性高估·下次预测应下调':'幅度基本准确')):'无方向判对样本';
+
+  // 基准对照：AI vs 动量跟涨/均值回归/历史频率/随机
+  const b=result.baselines||{};
+  let baseHtml='';
+  if(b.sample){
+    const items=[
+      ['AI 预测',b.ai_rate],['动量跟涨',b.momentum_rate],['均值回归',b.reversal_rate],
+      ['历史频率',b.base_rate],['随机',b.random_rate]];
+    const bars=items.map(([k,v])=>
+      '<div class="item" style="flex:1;min-width:86px"><div class="k" style="font-size:11px">'+k+'</div>'+
+      '<div class="v" style="font-size:13px">'+(v!=null?v+'%':'--')+'</div></div>').join('');
+    const exc=b.excess_vs_best;
+    const excTxt=exc!=null?(exc>0?'<span class="badge up">超额 +'+exc+'pp</span>':'<span class="badge down">低于基线 '+exc+'pp</span>'):'<span class="badge flat">样本不足</span>';
+    baseHtml='<div class="sec" style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px">'+
+      '<div style="font-size:12px;color:var(--sub);margin-bottom:6px">📊 基准对照（方向正确率，样本 '+b.sample+'）：'+excTxt+
+      '<span style="float:right;font-size:11px">AI 幅度偏差 ±'+b.ai_abs_dev+'% vs 动量 ±'+b.momentum_abs_dev+'%</span></div>'+
+      '<div class="row" style="margin:0">'+bars+'</div></div>';
+  }
+
+  // 信心校准：AI 自评信心档位 vs 实际方向正确率
+  const cc=result.confidence_calibration||[];
+  let calibHtml='';
+  if(cc.length){
+    const cells=cc.map(c=>{
+      const cls=c.direction_correct_rate>=60?'up':(c.direction_correct_rate>=40?'flat':'down');
+      return '<div class="item" style="flex:1;min-width:86px"><div class="k" style="font-size:11px">'+esc(c.level)+'信心</div>'+
+        '<div class="v" style="font-size:13px"><span class="badge '+cls+'">'+c.direction_correct_rate+'%</span>'+
+        '<span style="font-size:10px;color:var(--sub)">（'+c.sample+'只）</span></div></div>';
+    }).join('');
+    calibHtml='<div class="sec" style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px">'+
+      '<div style="font-size:12px;color:var(--sub);margin-bottom:6px">📊 信心校准（各档位实际方向正确率，高信心应明显高于低信心才可信）</div>'+
+      '<div class="row" style="margin:0">'+cells+'</div></div>';
+  }
+
   container.innerHTML = `
-    <h3>📋 复盘：${esc(result.date)} · 共 ${result.total} 只基金</h3>
+    <h3>📋 复盘：对 ${esc(String(result.date).slice(5))} 日 · 共 ${result.total} 只基金</h3>
     <div class="row" style="margin-bottom:12px">
       <div class="item"><div class="k">整体方向正确率</div><div class="v">${result.direction_correct_count}/${result.total}</div></div>
       <div class="item"><div class="k">平均准确率</div><div class="v"><span class="badge ${avgCls}">${result.avg_accuracy}%</span></div></div>
+      <div class="item"><div class="k">幅度偏差率(方向对)</div><div class="v"><span class="badge ${biasVal!=null&&Math.abs(biasVal)>0.05?'flat':'up'}">${biasTxt}</span><div style="font-size:11px;color:var(--sub)">${biasHint}</div></div></div>
     </div>
+    ${baseHtml}
+    ${calibHtml}
     ${comboHtml}
     <h3>🤖 偏差原因与改进建议</h3>
     <div class="v" style="font-weight:400;line-height:1.7;margin-bottom:14px">${esc(result.deviation_reason||'（未配置 LLM，无法分析偏差原因）')}</div>
     ${rows}
-    <div style="margin-top:10px;color:var(--sub);font-size:11px">准确率=方向对50%+幅度误差<0.3%得50%、<0.6%得30%；组合实际=持仓市值加权涨跌</div>
+    <div style="margin-top:10px;color:var(--sub);font-size:11px">准确率=方向对50%+幅度误差<0.3%得50%、<0.6%得30%；幅度偏差率=仅方向判对的基金(实际-预测)均值，为正表示系统性低估涨幅，已自动喂入下次分析作修正值；组合实际=持仓市值加权涨跌</div>
   `;
 }
 
@@ -3471,20 +3700,6 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
 .titlebar .btns button.boot.on{background:rgba(var(--orange-rgb),.4);color:#fff}
 .titlebar .btns button.cls:hover{background:rgba(var(--up-rgb),.45)}
 
-/* 收起态（缩小到右下角） */
-.collapsed{display:none;flex:1;align-items:center;gap:10px}
-.collapsed .c-info{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
-.collapsed .c-item{font-size:11px;color:var(--sub);white-space:nowrap}
-.collapsed .c-item b{color:var(--txt);font-size:13px;font-variant-numeric:tabular-nums;margin-left:4px}
-.collapsed .expand{cursor:pointer;border:none;border-radius:8px;width:34px;height:34px;
-  font-size:16px;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand));flex:none}
-body.collapsed .titlebar{display:none}
-body.collapsed .sum{display:none}
-body.collapsed .list{display:none}
-body.collapsed .bar{display:none}
-body.collapsed .collapsed{display:flex}
-body.collapsed #mini{padding:10px 12px;gap:0}
-
 /* 汇总 */
 .sum{display:grid;grid-template-columns:1.1fr 1fr;gap:10px}
 .box{background:var(--panel);
@@ -3523,7 +3738,6 @@ body.collapsed #mini{padding:10px 12px;gap:0}
       <button id="themeBtn" onclick="toggleTheme()" title="切换深色/浅色主题">🌙</button>
       <button id="pinbtn" class="pin on" onclick="togglePin()" title="取消置顶">📌</button>
       <button id="bootbtn" onclick="toggleBoot()" title="开机自启">🚀</button>
-      <button id="foldbtn" onclick="toggleCollapse()" title="缩小到右下角">⤓</button>
       <button class="cls" onclick="expand()" title="关闭（回到主窗口）">✕</button>
     </span>
   </div>
@@ -3540,15 +3754,8 @@ body.collapsed #mini{padding:10px 12px;gap:0}
   </div>
   <div class="list" id="list"></div>
   <div class="bar">
-    <button class="close" onclick="quit()">退出</button>
+    <button class="close" onclick="hideToTray()" title="隐藏到系统托盘（右键托盘可彻底退出）">隐藏到托盘</button>
     <button onclick="expand()">展开完整版</button>
-  </div>
-  <div class="collapsed">
-    <div class="c-info">
-      <span class="c-item">总资产<b id="c-total">--</b></span>
-      <span class="c-item">今日收益<b id="c-profit">--</b></span>
-    </div>
-    <button class="expand" onclick="toggleCollapse()" title="展开">⤢</button>
   </div>
 </div>
 
@@ -3558,6 +3765,13 @@ function cls(v){return v>0?'up':(v<0?'down':'flat')}
 function fmt(v,d=2){return v==null?'--':Number(v).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d})}
 function sgn(v,d=2){return (v>0?'+':'')+fmt(v,d)}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function pctTag(f){
+  if(!f) return '';
+  if(f.est) return '<small class="stale">预估</small>';
+  const d=new Date();
+  const t=String(d.getFullYear())+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  return '<small class="stale">'+(f.qdate===t?'收盘':'昨日收盘')+'</small>';
+}
 
 let darkMode=false;
 function applyTheme(dark){
@@ -3578,12 +3792,6 @@ function toggleTheme(){
 
 function render(st){
   state=st;
-  // 收起态与 Python 状态同步（默认收起模式）
-  if(typeof st.collapsed!=='undefined'){
-    document.body.classList.toggle('collapsed', !!st.collapsed);
-    const fb=document.getElementById('foldbtn');
-    if(fb){fb.textContent=st.collapsed?'⤢':'⤓';fb.title=st.collapsed?'展开':'缩小到右下角';}
-  }
   const masked=!!st.mask;
   document.getElementById('total').textContent=masked?'****':fmt(st.total);
   const p=document.getElementById('profit');
@@ -3596,11 +3804,6 @@ function render(st){
   const ce=document.getElementById('cum-rate');
   ce.textContent=cr==null?'--':'累计 '+sgn(cr)+'%';
   ce.className='v '+cls(cr);
-  // 收起态也同步
-  document.getElementById('c-total').textContent=masked?'****':fmt(st.total);
-  const cp=document.getElementById('c-profit');
-  cp.textContent=(st.profit>0?'+':'')+fmt(st.profit);
-  cp.className=cls(st.profit);
   const list=document.getElementById('list');
   if(!st.funds.length){list.innerHTML='<div class="empty">暂无持仓</div>';return;}
   // 排序：先按涨幅降序，涨幅相同再按持仓占比降序
@@ -3613,14 +3816,14 @@ function render(st){
     '<div class="item">'+
       '<span class="code">'+f.code+'</span>'+
       '<span class="name">'+esc(f.name)+'</span>'+
-      '<span class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+(f.est?'':'<small class="stale">'+(f.qdate?f.qdate.slice(5):'昨收')+'</small>')+'</span>'+
+      '<span class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+pctTag(f)+'</span>'+
       '<span class="val">'+(f.value?fmt(f.value):'--')+'</span>'+
     '</div>'
   ).join('');
 }
 
 async function expand(){await pywebview.api.show_main()}
-async function quit(){await pywebview.api.quit_app()}
+async function hideToTray(){await pywebview.api.hide_to_tray()}
 
 async function togglePin(){
   const r=await pywebview.api.toggle_pin();
@@ -3648,24 +3851,15 @@ function applyBootState(on){
 }
 
 async function toggleCollapse(){
-  const r=await pywebview.api.toggle_collapse();
-  if(r && r.ok){
-    document.body.classList.toggle('collapsed', r.collapsed);
-    const b=document.getElementById('foldbtn');
-    b.textContent = r.collapsed ? '⤢' : '⤓';
-    b.title = r.collapsed ? '展开' : '缩小到右下角';
-  }
+  // 收起功能已移除，悬浮窗固定展开
+  return;
 }
 
 window.addEventListener('pywebviewready',()=>{
-  // 恢复保存的 UI 偏好（默认收起 + 默认隐藏金额 + 自启状态）
+  // 恢复保存的 UI 偏好（默认隐藏金额 + 自启状态）
   pywebview.api.get_ui_status().then(r=>{
     if(r && r.ok){
-      document.body.classList.toggle('collapsed', !!r.collapsed);
       applyBootState(!!r.autostart);
-      const b=document.getElementById('foldbtn');
-      if(r.collapsed){b.textContent='⤢';b.title='展开';}
-      else{b.textContent='⤓';b.title='缩小到右下角';}
     }
   });
   // 今日分析持久化：重启后把今天已保存的分析报告渲染出来
@@ -3682,6 +3876,11 @@ window.addEventListener('pywebviewready',()=>{
 
 
 def main():
+    # 单实例锁：托盘常驻后重复双击 exe 会多开，窗口互相干扰（悬浮窗显示不出来/主窗口消失）
+    if not _single_instance_check():
+        import os as _os
+        _os._exit(0)
+
     # 屏蔽 pywebview 内部对 window.native 序列化的无害报错日志
     import logging
     logging.getLogger("pywebview").setLevel(logging.CRITICAL)
@@ -3697,6 +3896,9 @@ def main():
 
         def quit_app(self):
             return api.quit_app()
+
+        def hide_to_tray(self):
+            return api.hide_to_tray()
 
         def manual_refresh(self):
             return api.manual_refresh()
@@ -3731,6 +3933,22 @@ def main():
     api._main_window = main_window
     api._float_window = float_window
     api._windows = [main_window, float_window]
+
+    # 主窗口 ✕ 关闭 → 拦截，隐藏到系统托盘（托盘常驻，不退出）
+    def _on_main_closing(*args, **kwargs):
+        if api._quitting:
+            return None  # 真正退出时放行
+        try:
+            main_window.hide()
+            api._main_visible = False
+        except Exception:
+            pass
+        api._ensure_tray()
+        return False  # 取消关闭
+
+    main_window.events.closing += _on_main_closing
+    # 启动即创建托盘（保证常驻；缺 pystray 时静默降级）
+    api._ensure_tray()
 
     def loop():
         while True:
