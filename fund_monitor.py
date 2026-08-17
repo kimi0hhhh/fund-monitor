@@ -252,7 +252,11 @@ def _fetch_estimate(code, base):
                 return gz, pct, t, "dj"
     except Exception:
         pass
-    # 4) 指数近似（ETF 联接/指数基金 → 跟踪标的全天候实时涨跌）
+    # 4) 主动基金重仓股加权估算（真实持仓实时涨跌加权，比单指数准）
+    est = _fetch_top_stocks_estimate(code, base)
+    if est:
+        return est
+    # 5) 指数/主题近似（ETF 联接/指数基金 → 跟踪标的实时涨跌）
     return _fetch_index_estimate(code, base)
 
 
@@ -280,12 +284,75 @@ FUND_INDEX_MAP = {
     "016665": ("usINX", "theme"),   # 天弘全球高端制造(QDII)C → 标普500
     "012922": ("usNDX", "theme"),   # 易方达全球成长精选(QDII)C → 纳斯达克100
     # ---- 主动混合（theme：主题近似，仅供参考）----
-    "025500": ("sz399006", "theme"),  # 东方阿尔法科技智选C → 创业板指
-    "018957": ("sh512660", "theme"),  # 中航机遇领航C → 军工ETF国泰
-    "021528": ("sz399006", "theme"),  # 财通成长优选C → 创业板指
-    "013566": ("sz399967", "theme"),  # 华夏军工安全C → 中证军工
-    "014320": ("sh512480", "theme"),  # 德邦半导体产业C → 半导体ETF国联安
 }
+
+
+# 主动混合基金 → 最新季报前十大重仓股（代码, 权重%）。用实时行情按权重加权估算，
+# 比套用单一行业指数准得多。数据来源：2026-06-30 二季报。
+# 行情代码：A股 sz/sh 前缀；港股 r_hk 前缀；美股 us 前缀。
+FUND_TOP_STOCKS = {
+    # 华夏军工安全C（军工电子/材料）
+    "013566": [("sh688385", 9.78), ("sh688281", 9.02), ("sz000962", 8.97), ("sh688375", 8.60),
+               ("sh600562", 8.09), ("sz300593", 8.00), ("sz002025", 6.93), ("sh600482", 6.00),
+               ("sh600378", 5.60), ("sz302132", 5.14)],
+    # 德邦半导体产业C（半导体设备/芯片）
+    "014320": [("sh603986", 6.84), ("sh688256", 5.89), ("sh688012", 5.62), ("sh688167", 5.32),
+               ("sh688981", 4.85), ("sz300604", 4.83), ("r_hk01347", 4.79), ("sz002371", 4.19),
+               ("sz300054", 4.18), ("sh688041", 3.85)],
+    # 东方阿尔法科技智选C（存储/芯片设计）
+    "025500": [("sh603986", 8.31), ("sz300475", 7.30), ("sz301308", 6.90), ("sz300223", 6.82),
+               ("sz300788", 6.80), ("sz001309", 6.79), ("sh688766", 6.32), ("sh688008", 4.88),
+               ("sh688110", 4.27), ("sh688123", 3.95)],
+    # 财通成长优选C（光模块/PCB/电子材料）
+    "021528": [("sz300502", 9.47), ("sh688519", 8.75), ("sh688498", 8.63), ("sz300408", 7.93),
+               ("sz301511", 7.92), ("sz301377", 7.82), ("sz301200", 7.10), ("sz000636", 6.80),
+               ("sh605376", 4.28), ("sh603186", 3.61)],
+    # 中航机遇领航C（光通信/光模块）
+    "018957": [("sz300502", 9.91), ("sz300308", 9.41), ("sz300394", 9.07), ("sh688048", 7.42),
+               ("sh600183", 6.77), ("sh600105", 6.46), ("sh688313", 5.57), ("sh601869", 4.87),
+               ("sh601138", 4.73), ("sz000725", 3.77)],
+}
+
+
+def _fetch_top_stocks_estimate(code, base):
+    """主动基金重仓股加权估算：前十大重仓股实时涨跌按权重加权。
+    估算净值 = 昨日官方净值 × (1 + 加权涨跌幅% / 覆盖率)；
+    覆盖率=前十大权重合计，权重未满100%部分按加权涨跌外推。
+    返回 (gz, pct, time, "holdings")，失败返回 None。"""
+    stocks = FUND_TOP_STOCKS.get(code)
+    if not stocks or not base.get("nav"):
+        return None
+    try:
+        q = ",".join(tc for tc, _w in stocks)
+        r = requests.get(f"http://qt.gtimg.cn/q={q}", headers=HEADERS,
+                         timeout=6, proxies=_get_proxies())
+        r.encoding = "gbk"
+        # 解析各代码的涨跌幅 p[32]（A股/港股均为 ~ 分隔）
+        pct_map = {}
+        for m in re.finditer(r'v_(\w+)="([^"]*)"', r.text):
+            p = m.group(2).split("~")
+            if len(p) > 32:
+                v = _f(p[32])
+                if v is not None:
+                    pct_map[m.group(1)] = v
+        if not pct_map:
+            return None
+        # 按权重加权（只统计成功取到行情的股票）
+        total_w = 0.0
+        weighted = 0.0
+        for tc, w in stocks:
+            if tc in pct_map:
+                weighted += pct_map[tc] * w
+                total_w += w
+        if total_w <= 0:
+            return None
+        # 覆盖率不足 100%，按已有重仓股加权涨跌外推整体涨跌
+        pct = weighted / total_w
+        gz = round(base["nav"] * (1 + pct / 100.0), 4)
+        return gz, round(pct, 2), datetime.now().strftime("%Y-%m-%d %H:%M"), "holdings"
+    except Exception:
+        pass
+    return None
 
 
 def _fetch_index_estimate(code, base):
@@ -2078,6 +2145,7 @@ function render(st){
     if(f.code===selCode)tr.className='sel';
     const badge=f.est
       ? (f.est_src==='idx'?'<span class="badge est">指数近似</span>'
+        : f.est_src==='holdings'?'<span class="badge est">重仓估算</span>'
         : f.est_src==='theme'?'<span class="badge est">主题近似</span>'
         : '<span class="badge est">盘中估值</span>')
       : '<span class="badge nav">最新净值</span>';
