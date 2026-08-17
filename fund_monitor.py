@@ -30,6 +30,7 @@ ICON_FILE = os.path.join(BASE_DIR, "app.ico")
 IDLE_FILE = os.path.join(BASE_DIR, "idle_cash.json")
 RATE_FILE = os.path.join(BASE_DIR, "rate_history.json")
 PROXY_FILE = os.path.join(BASE_DIR, "proxy_config.json")
+UI_CONFIG_FILE = os.path.join(BASE_DIR, "ui_config.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,6 +62,64 @@ def _get_proxies():
     if "://" not in p:
         p = "http://" + p
     return {"http": p, "https": p}
+
+
+# ---------- UI 偏好配置（收起态/隐藏金额/开机自启） ----------
+def load_ui_config():
+    """读取 UI 偏好：collapsed(悬浮窗默认收起)、mask(默认隐藏金额)、autostart(开机自启)"""
+    default = {"collapsed": True, "mask": True, "autostart": False}
+    try:
+        with open(UI_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return {**default, **json.load(f)}
+    except Exception:
+        return default
+
+
+def save_ui_config(cfg):
+    try:
+        with open(UI_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _autostart_enabled():
+    """读取注册表 Run 键，判断是否开机自启"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, "基金监控")
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+
+def _autostart_set(enabled):
+    """写/删注册表 Run 键，实现开机自启（当前用户级，无需管理员权限）"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        if enabled:
+            exe = os.path.abspath(sys.executable)
+            winreg.SetValueEx(key, "基金监控", 0, winreg.REG_SZ, f'"{exe}"')
+        else:
+            try:
+                winreg.DeleteValue(key, "基金监控")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
 
 
 def load_data():
@@ -147,6 +206,32 @@ def _screen_size():
         return max(1, int(round(w / scale))), max(1, int(round(h / scale)))
     except Exception:
         return 1920, 1080
+
+
+def _work_area():
+    """返回排除任务栏后的可用区域 (x, y, w, h)，逻辑像素；失败回退整屏"""
+    try:
+        import ctypes
+        # RECT = left, top, right, bottom
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+        rect = RECT()
+        SPI_GETWORKAREA = 0x30
+        ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+        try:
+            scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+        except Exception:
+            scale = 1.0
+        x = max(0, int(round(rect.left / scale)))
+        y = max(0, int(round(rect.top / scale)))
+        w = max(1, int(round((rect.right - rect.left) / scale)))
+        h = max(1, int(round((rect.bottom - rect.top) / scale)))
+        return x, y, w, h
+    except Exception:
+        sx, sy = _screen_size()
+        return 0, 0, sx, sy
 
 
 def _set_topmost(win, top):
@@ -509,9 +594,11 @@ class Api:
         self._refreshed = False
         self._tasks = {}  # 分析任务池：task_id -> {status, progress, msg, result}
         self._review_summary = None  # 收盘后复盘的汇总缓存
-        self._float_collapsed = False  # 悬浮窗是否收起（缩小到右下角）
+        self._state_lock = threading.RLock()  # 保护 data/info 读写，避免加载中并发渲染错乱
+        _ui = load_ui_config()
+        self._float_collapsed = bool(_ui.get("collapsed", True))  # 悬浮窗默认收起
         self._float_on_top = True  # 悬浮窗是否置顶
-        self._mask_amount = False  # 是否隐藏金额数字（总资产/闲钱打码，悬浮窗同步）
+        self._mask_amount = bool(_ui.get("mask", True))  # 默认隐藏金额（总资产/闲钱打码）
         self.idle_cash = load_idle_cash()  # 闲钱（可用于加减仓的闲置资金）
         self._rate_history = load_rate_history()  # 盘中收益率采样
         self._bench_pct = None  # 沪深300当日涨跌幅（基准对比线）
@@ -542,6 +629,11 @@ class Api:
 
     # ---- JS 可调用的接口 ----
     def get_state(self):
+        with self._state_lock:
+            return self._build_state()
+
+    def _build_state(self):
+        """构造推送给前端的完整状态（调用方需持有 _state_lock）"""
         funds = []
         total, profit, count, realized = 0.0, 0.0, 0, 0.0
         holdings = 0.0  # 持仓市值（不含闲钱），用于计算各基金占比
@@ -631,6 +723,7 @@ class Api:
             "idle_cash": self.idle_cash,
             "rate_points": self._rate_history.get(datetime.now().strftime("%Y-%m-%d"), []),
             "mask": self._mask_amount,
+            "collapsed": self._float_collapsed,
         }
 
     def add_fund(self, code, amount, confirm_days=1):
@@ -883,16 +976,17 @@ class Api:
             return
         infos = fetch_batch(codes)
         self._bench_pct = fetch_benchmark_pct()
-        for c, info in infos.items():
-            self.info[c] = info
-            if info.get("name"):
-                self.data.setdefault(c, {}).setdefault("name", info["name"])
-        for c in codes:
-            self._migrate(c)
-        self._confirm_orders()
-        self._settle()
-        self._refreshed = True
-        save_data(self.data)
+        with self._state_lock:
+            for c, info in infos.items():
+                self.info[c] = info
+                if info.get("name"):
+                    self.data.setdefault(c, {}).setdefault("name", info["name"])
+            for c in codes:
+                self._migrate(c)
+            self._confirm_orders()
+            self._settle()
+            self._refreshed = True
+            save_data(self.data)
         self._maybe_update_review_summary()
         self._sample_rate()
         self.push()
@@ -979,11 +1073,14 @@ class Api:
         return {"ok": True}
 
     def show_floating(self):
-        """切换到悬浮窗：隐藏主窗口，显示置顶小窗"""
+        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（按保存的偏好恢复收起/展开）"""
         if self._float_window:
             try:
                 self._main_window.hide()
                 self._float_window.show()
+                # 若保存的是收起态，确保窗口尺寸/位置为收起状态
+                if self._float_collapsed:
+                    self._apply_float_size()
             except Exception:
                 pass
         return {"ok": True}
@@ -999,10 +1096,31 @@ class Api:
         return {"ok": True}
 
     def toggle_mask_amount(self):
-        """切换金额隐藏（总资产/闲钱打码，悬浮窗同步）"""
+        """切换金额隐藏（总资产/闲钱打码，悬浮窗同步），偏好持久化"""
         self._mask_amount = not self._mask_amount
+        cfg = load_ui_config()
+        cfg["mask"] = self._mask_amount
+        save_ui_config(cfg)
         self.push()
         return {"ok": True, "mask": self._mask_amount}
+
+    def toggle_autostart(self):
+        """切换开机自启（注册表 Run 键），偏好持久化"""
+        enabled = not _autostart_enabled()
+        ok = _autostart_set(enabled)
+        cfg = load_ui_config()
+        cfg["autostart"] = enabled
+        save_ui_config(cfg)
+        return {"ok": ok, "autostart": enabled}
+
+    def get_ui_status(self):
+        """返回 UI 偏好状态（供悬浮窗初始化）"""
+        return {
+            "ok": True,
+            "mask": self._mask_amount,
+            "collapsed": self._float_collapsed,
+            "autostart": _autostart_enabled(),
+        }
 
     def quit_app(self):
         """退出应用"""
@@ -1034,20 +1152,35 @@ class Api:
             return {"ok": False, "msg": "无悬浮窗"}
         try:
             self._float_collapsed = not self._float_collapsed
-            sw, sh = _screen_size()
-            if self._float_collapsed:
-                cw, ch = 260, 72
-            else:
-                cw, ch = 320, 460
-            w.resize(cw, ch)
-            # 坐标防越界：DPI 缩放/多显示器下避免窗口飞出屏幕外（移出后点不到展开按钮，表现为"无响应"）
-            x = max(0, sw - cw - 14)
-            y = max(0, sh - ch - 14)
-            w.move(x, y)
+            self._apply_float_size()
+            # 偏好持久化
+            cfg = load_ui_config()
+            cfg["collapsed"] = self._float_collapsed
+            save_ui_config(cfg)
             return {"ok": True, "collapsed": self._float_collapsed}
         except Exception as e:
             self._float_collapsed = not self._float_collapsed
             return {"ok": False, "msg": str(e)[:80]}
+
+    def _apply_float_size(self):
+        """按当前收起/展开状态设置悬浮窗尺寸与位置（工作区内，避开任务栏）"""
+        w = self._float_window
+        if not w:
+            return
+        if self._float_collapsed:
+            cw, ch = 260, 72
+        else:
+            cw, ch = 320, 460
+        w.resize(cw, ch)
+        # 用排除任务栏后的可用区域定位，避免收起窗口压在底部任务栏上
+        # （之前用整屏高度，窗口底部落在任务栏内，展开按钮被挡，表现为"缩进隐藏图标"）
+        wax, way, waw, wah = _work_area()
+        margin = 14
+        x = max(wax, wax + waw - cw - margin)
+        y = max(way, way + wah - ch - margin)
+        w.move(x, y)
+        # resize/move 后重新置顶，避免丢失 z-order 被其他窗口盖住
+        _set_topmost(w, self._float_on_top)
 
     # ---------- 分析模式 API ----------
     def get_analysis_config(self):
@@ -1273,6 +1406,34 @@ class Api:
         return {
             "prediction": h.get("predictions", {}).get(code),
             "report": h.get("reports", {}).get(code),
+        }
+
+    def get_today_analysis(self):
+        """返回今天已保存的分析结果（重启后可重新渲染，实现"今日分析留在上面"）"""
+        if fa is None:
+            return {"ok": False, "msg": "fund_analysis 模块未加载"}
+        today = datetime.now().strftime("%Y-%m-%d")
+        h = fa.get_history(today) or {}
+        predictions = h.get("predictions", {}) or {}
+        portfolio = h.get("portfolio")
+        if not predictions and not portfolio:
+            return {"ok": True, "has": False}
+        results = []
+        for code, pred in predictions.items():
+            if not isinstance(pred, dict):
+                continue
+            name = (self.data.get(code, {}).get("name")
+                    or self.info.get(code, {}).get("name") or code)
+            results.append({"ok": True, "code": code, "name": name, "report": pred})
+        return {
+            "ok": True,
+            "has": True,
+            "type": "full",
+            "portfolio": {"ok": True, "report": portfolio} if portfolio else None,
+            "results": results,
+            "ok_count": len(results),
+            "total": len(results),
+            "analyzed_at": today,
         }
 
     def get_history_full(self, date_str):
@@ -3228,8 +3389,24 @@ function renderReviewAll(result, container){
 
 // 拦截 saveModal 不需要单独覆写，openSettings 直接设置 inp.dataset.mode='settings'
 
+// 今日分析持久化：重启后把今天已保存的分析报告重新渲染到「分析」页
+function renderTodayAnalysis(r){
+  const rep = document.getElementById('ana-report');
+  if(!rep) return;
+  if(!r.has){ rep.innerHTML=''; return; }
+  try{
+    renderFullReport(r, rep);
+  }catch(e){
+    rep.innerHTML = '<div class="empty-state">今日分析数据读取失败</div>';
+  }
+}
+
 window.addEventListener('pywebviewready',()=>{
   pywebview.api.manual_refresh();
+  // 恢复今天已保存的分析（关闭重开后还在）
+  pywebview.api.get_today_analysis().then(r=>{
+    if(r && r.ok) renderTodayAnalysis(r);
+  }).catch(()=>{});
   // 开市日净值更新完（23:00）后自动复盘一次加减仓建议；休市日/已更新完则不设
   const now=new Date();
   const closeAt=new Date(now.getFullYear(),now.getMonth(),now.getDate(),23,0,5);
@@ -3287,10 +3464,11 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
 .titlebar .drag{flex:1;height:100%;display:flex;align-items:center;gap:6px;
   font-size:12px;font-weight:600;color:var(--sub);cursor:move}
 .titlebar .btns{display:flex;gap:6px;flex:none}
-.titlebar .btns button{cursor:pointer;border:none;border-radius:6px;width:26px;height:22px;
+.titlebar .btns button{cursor:pointer;border:none;border-radius:6px;width:24px;height:22px;
   font-size:12px;line-height:1;color:var(--txt);background:rgba(0,0,0,.08);padding:0}
 .titlebar .btns button:hover{background:rgba(0,0,0,.1)}
 .titlebar .btns button.pin.on{background:rgba(var(--brand-rgb),.4);color:#fff}
+.titlebar .btns button.boot.on{background:rgba(var(--orange-rgb),.4);color:#fff}
 .titlebar .btns button.cls:hover{background:rgba(var(--up-rgb),.45)}
 
 /* 收起态（缩小到右下角） */
@@ -3344,6 +3522,7 @@ body.collapsed #mini{padding:10px 12px;gap:0}
     <span class="btns">
       <button id="themeBtn" onclick="toggleTheme()" title="切换深色/浅色主题">🌙</button>
       <button id="pinbtn" class="pin on" onclick="togglePin()" title="取消置顶">📌</button>
+      <button id="bootbtn" onclick="toggleBoot()" title="开机自启">🚀</button>
       <button id="foldbtn" onclick="toggleCollapse()" title="缩小到右下角">⤓</button>
       <button class="cls" onclick="expand()" title="关闭（回到主窗口）">✕</button>
     </span>
@@ -3399,6 +3578,12 @@ function toggleTheme(){
 
 function render(st){
   state=st;
+  // 收起态与 Python 状态同步（默认收起模式）
+  if(typeof st.collapsed!=='undefined'){
+    document.body.classList.toggle('collapsed', !!st.collapsed);
+    const fb=document.getElementById('foldbtn');
+    if(fb){fb.textContent=st.collapsed?'⤢':'⤓';fb.title=st.collapsed?'展开':'缩小到右下角';}
+  }
   const masked=!!st.mask;
   document.getElementById('total').textContent=masked?'****':fmt(st.total);
   const p=document.getElementById('profit');
@@ -3446,6 +3631,22 @@ async function togglePin(){
   }
 }
 
+async function toggleBoot(){
+  const r=await pywebview.api.toggle_autostart();
+  if(r && r.ok){
+    const b=document.getElementById('bootbtn');
+    if(r.autostart){b.classList.add('on');b.textContent='🚀';b.title='开机自启：开（点击关闭）';}
+    else{b.classList.remove('on');b.textContent='🛰';b.title='开机自启：关（点击开启）';}
+  }
+}
+
+function applyBootState(on){
+  const b=document.getElementById('bootbtn');
+  if(!b) return;
+  if(on){b.classList.add('on');b.textContent='🚀';b.title='开机自启：开（点击关闭）';}
+  else{b.classList.remove('on');b.textContent='🛰';b.title='开机自启：关（点击开启）';}
+}
+
 async function toggleCollapse(){
   const r=await pywebview.api.toggle_collapse();
   if(r && r.ok){
@@ -3457,6 +3658,22 @@ async function toggleCollapse(){
 }
 
 window.addEventListener('pywebviewready',()=>{
+  // 恢复保存的 UI 偏好（默认收起 + 默认隐藏金额 + 自启状态）
+  pywebview.api.get_ui_status().then(r=>{
+    if(r && r.ok){
+      document.body.classList.toggle('collapsed', !!r.collapsed);
+      applyBootState(!!r.autostart);
+      const b=document.getElementById('foldbtn');
+      if(r.collapsed){b.textContent='⤢';b.title='展开';}
+      else{b.textContent='⤓';b.title='缩小到右下角';}
+    }
+  });
+  // 今日分析持久化：重启后把今天已保存的分析报告渲染出来
+  pywebview.api.get_today_analysis().then(r=>{
+    if(r && r.ok && r.has){
+      if(typeof renderTodayAnalysis==='function') renderTodayAnalysis(r);
+    }
+  }).catch(()=>{});
   pywebview.api.manual_refresh();
 });
 </script>
@@ -3489,6 +3706,15 @@ def main():
 
         def toggle_collapse(self):
             return api.toggle_collapse()
+
+        def toggle_autostart(self):
+            return api.toggle_autostart()
+
+        def get_ui_status(self):
+            return api.get_ui_status()
+
+        def get_today_analysis(self):
+            return api.get_today_analysis()
 
     main_window = webview.create_window(
         "我的基金监控", html=HTML_MAIN, js_api=api,
