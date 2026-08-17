@@ -26,12 +26,27 @@ HISTORY_FILE = os.path.join(BASE_DIR, "analysis_history.json")
 SIGNALS_FILE = os.path.join(BASE_DIR, "signals.json")
 TRADE_REVIEW_FILE = os.path.join(BASE_DIR, "trade_review.json")
 TRADE_LESSONS_FILE = os.path.join(BASE_DIR, "trade_lessons.json")
+PROXY_FILE = os.path.join(BASE_DIR, "proxy_config.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Referer": "http://fundf10.eastmoney.com/",
 }
+
+
+def _get_proxies():
+    """读取 proxy_config.json 的代理配置（与 fund_monitor 共用），无则返回 None"""
+    try:
+        with open(PROXY_FILE, "r", encoding="utf-8") as f:
+            p = (json.load(f).get("proxy") or "").strip()
+    except Exception:
+        return None
+    if not p:
+        return None
+    if "://" not in p:
+        p = "http://" + p
+    return {"http": p, "https": p}
 
 
 # ================== 配置管理 ==================
@@ -122,7 +137,7 @@ def fetch_history(code, days=90):
             r = requests.get(
                 f"http://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex={page}"
                 f"&pageSize={page_size}&mode=0",
-                headers=HEADERS, timeout=10,
+                headers=HEADERS, timeout=10, proxies=_get_proxies(),
             )
             d = r.json()
             items = d.get("Data", {}).get("LSJZList", [])
@@ -168,7 +183,7 @@ def fetch_holdings(code):
              "Referer": "https://fundf10.eastmoney.com/"}
         url = (f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
                f"?FCODE={code}&deviceid=Wap&plat=Wap&product=EFund&version=2.0.0")
-        r = requests.get(url, headers=h, timeout=10)
+        r = requests.get(url, headers=h, timeout=10, proxies=_get_proxies())
         d = r.json()
         stocks = (d.get("Datas") or {}).get("fundStocks", []) or []
         out = []
