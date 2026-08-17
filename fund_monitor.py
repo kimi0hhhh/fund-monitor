@@ -329,6 +329,7 @@ class Api:
     def get_state(self):
         funds = []
         total, profit, count, realized = 0.0, 0.0, 0, 0.0
+        holdings = 0.0  # 持仓市值（不含闲钱），用于计算各基金占比
         pending = []
         # 今日预测（当天做过分析才有）
         today_preds = {}
@@ -357,6 +358,7 @@ class Api:
                 pf = value - value / (1 + pct / 100.0)
                 profit += pf
             total += value
+            holdings += value
             count += 1
             bought = d.get("bought", 0.0) or 0.0
             sold = d.get("sold", 0.0) or 0.0
@@ -385,6 +387,7 @@ class Api:
             funds.append({
                 "code": code, "name": name, "pct": pct,
                 "value": value or None,
+                "ratio": round(value / holdings * 100, 1) if holdings and value else 0.0,
                 "profit": pf,
                 "realized": cum,
                 "shares": shares,
@@ -3159,7 +3162,13 @@ function render(st){
   cp.className=cls(st.profit);
   const list=document.getElementById('list');
   if(!st.funds.length){list.innerHTML='<div class="empty">暂无持仓</div>';return;}
-  list.innerHTML=st.funds.map(f=>
+  // 排序：先按涨幅降序，涨幅相同再按持仓占比降序
+  const sorted=[...st.funds].sort((a,b)=>{
+    const pa=a.pct==null?-Infinity:a.pct, pb=b.pct==null?-Infinity:b.pct;
+    if(pb!==pa) return pb-pa;
+    return (b.ratio||0)-(a.ratio||0);
+  });
+  list.innerHTML=sorted.map(f=>
     '<div class="item">'+
       '<span class="code">'+f.code+'</span>'+
       '<span class="name">'+esc(f.name)+'</span>'+
