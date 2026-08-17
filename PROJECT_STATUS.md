@@ -3,10 +3,11 @@
 > 触发：用户说「基金监控项目」时，先读本文件接续开发。
 
 ## 位置与产物
-- 项目目录：`C:\Users\10719\WorkBuddy\2026-08-15-19-22-30\基金监控\`
-- 产物：`dist\基金监控.exe`（已复制到桌面 `C:\Users\10719\Desktop\基金监控.exe`）
+- 项目目录：`C:\Users\10719\Desktop\基金监控项目\`（2026-08-17 19:00 从 WorkBuddy 工作区整体移动至此）
+- 产物：`dist\基金监控.exe`（另有一份部署版 `基金监控.exe` 在项目根目录，可直接运行）
+- 数据文件：`funds_data.json` 等 7 个 json 已随项目移入项目根目录（与 exe 同目录，2026-08-17 19:03）
 - 源码：`fund_monitor.py`（主程序，内嵌 HTML_MAIN / HTML_MINI 两套界面）、`fund_analysis.py`（AI 分析模块）、`make_icon.py`、`app.ico`
-- 说明文档：`使用说明.md`
+- 说明文档：`使用说明.md`（已并入 README.md）
 
 ## 技术栈
 - Python 3.13（venv：`C:\Users\10719\.workbuddy\binaries\python\envs\fundapp`）
@@ -70,9 +71,56 @@ cp dist/基金监控.exe 桌面路径
 - **复盘改净值更新后 + 日期筛选**（2026-08-16）：复盘仅限开市日 23:00 后（`market_closed`=开市且 hour>=23，等基金当日净值更新完，整点/16点都不准），盘中/休市返回提示；加减仓复盘 tab 顶部加日期筛选下拉（全部+去重日期倒序，选中保留）；状态提示显示「今天休市/净值未更新完」；主窗口启动时 setTimeout 到 23:00 自动复盘一次（不轮询）。**未打包**
 - **复盘闭环强化**（2026-08-16）：①`review_trade_advice` 增加结构化 `bias_type`（方向误判/时机过早或过晚/追涨杀跌情绪化/幅度误判/信息不足/其他）②复盘 worker 完成后调 `summarize_trade_lessons()` 提炼 3-6 条经验教训缓存到 `trade_lessons.json` ③`build_trade_review_context` 喂回下次分析：盈利占比+偏差类型分布+经验教训+最近3条亏损案例 ④前端加减仓复盘 tab 顶部显示经验教训区块、每条复盘带偏差类型徽章 ⑤`get_trade_reviews` 返回 lessons。**已发版（2026-08-16 23:22 桌面 exe 已替换，含开市日/收盘/日期筛选/闭环全部改动）**
 - **23:00 后启动补复盘**（2026-08-16 23:28 二版）：修复边界——程序在 23:00 后启动时，原 setTimeout 定时器不触发（delay 为负），导致错过当晚自动复盘；现在启动 3 秒后补一次 autoReviewTrades（休市日内部会跳过）。**已重新发版**
+
+## 发版与发布（2026-08-17 00:10）
+- 便携版压缩包：`桌面\基金监控_便携版.zip`（exe+使用说明+全部数据 json，19.8MB，换电脑无缝迁移）
+- 纯净版压缩包：`桌面\基金监控_纯净版.zip`（exe+使用说明+README，无数据）
+- **GitHub 公开仓库**：`https://github.com/kimi0hhhh/fund-monitor`（用户 kimi0hhhh）
+  - 上传内容：源码+文档 10 个文件（fund_monitor.py / fund_analysis.py / make_icon.py / 使用说明.md / README.md / app.ico / app_preview.png / 基金监控.spec / .gitignore / PROJECT_STATUS.md）
+  - 数据 json 和 exe 已 gitignore，未上传（含 API key/持仓隐私）
+  - **坑：github.com 域名在本机 SSL 握手失败/408 超时（git push 不可用）**，改用 GitHub Contents API（api.github.com 正常）逐文件 PUT 上传成功；Git Data API 对空仓库报 409，需先用 Contents API 建初始 commit
+  - 本地 git 仓库已 init + commit + 配 origin（URL 无 token）；git push 需网络恢复后执行
+- **⚠️ 安全提醒：用户提供的两个 PAT 已在 GitHub 会话中明文使用，建议用户到 GitHub Settings → Developer settings → Personal access tokens 删除**
+- **完整使用说明**（2026-08-17 00:15）：重写 `使用说明.md`（14 章节：简介/安装/持仓/AI分析/预测复盘/信号/加减仓复盘闭环机制/设置/数据文件/FAQ/免责声明），已同步 GitHub（Contents API 更新 sha ca8e8a94），两个压缩包已重新生成
+- **文档重组 + 持仓接口修复 + 发版**（2026-08-17 00:29）：①README.md 即完整中文使用说明、README_EN.md 英文版（删除使用说明.md/USER_GUIDE_EN.md，本地+GitHub 已同步，远程 10 文件）②**东财持仓接口修复**：fund_analysis.py fetch_holdings 改 iPhone UA + deviceid=Wap（原 Android UA+deviceid=W 被反爬拦截，实测 Success=False；修复后实测 10 只持仓正常），已同步 GitHub（sha afcd192b）③重新打包替换桌面 exe（00:28，启动验证正常）
+- **桌面 exe 更新至 v2.0.5**（2026-08-17 18:29）：从 GitHub main 拉取全部 13 个文件（SHA 校验通过、语法检查通过）后，用 `build.py --venv fundapp --skip-install --copy-to 桌面` 打包替换桌面 exe；v2.0.5 含自定义模型配置/重仓股加权估算/代理/开机自启/今日分析持久化/并发锁等新功能
+- **托盘常驻 v2.0.6**（2026-08-17 18:40）：①主窗口 ✕ 拦截 `events.closing` 返回 False → 隐藏到系统托盘（不再退出）②托盘左键=显示/隐藏主窗口，右键菜单=显示主窗口/显示悬浮窗/彻底退出 ③悬浮窗「退出」按钮改为「隐藏到托盘」④依赖 pystray+pillow（spec hiddenimports 已加 `pystray._win32`）⑤quit_app 先停托盘再 destroy+os._exit。已打包替换桌面 exe（26MB），冒烟测试通过（窗口列表出现 `fund_monitor...SystemTrayIcon` 托盘类窗口）
+- **悬浮窗显示修复 v2.0.7**（2026-08-17 19:16）：①**单实例锁** `_single_instance_check()`（CreateMutex）——托盘常驻后重复双击 exe 曾多开 5 个实例，窗口互相 hide/show、主窗口被移出屏幕外，导致悬浮窗"显示不出来"；现在重复启动直接退出 ②**悬浮窗默认展开**：ui_config `collapsed` 默认 False（原来是 True，点悬浮窗只显示 260x72 小条）③show_floating 不再静默吞异常：失败时打印日志并恢复主窗口。验证：源码方式调用 show_floating 后悬浮窗 visible=True（378x516 展开态）。已重新打包
+- **彻底移除收起功能 v2.0.8**（2026-08-17 19:29）：v2.0.7 未根治——`toggle_collapse` 仍会把 `collapsed=true` 写回 ui_config，点「⤓」后悬浮窗又变右下角小条。本次彻底删除收起：删除 `toggle_collapse` 收起逻辑（改为恒返回 False）、`_apply_float_size`、悬浮窗「⤓」按钮、`.collapsed` 收起态 HTML 区块、JS 的 collapsed 同步、CSS 收起态样式；`_float_collapsed` 固定 False；ui_config 删除 collapsed 字段。验证：show_floating 后悬浮窗 378x516 展开态 ✅。deploy_check.py 修复路径 bug（改用 cwd）。已重新打包
+- **复盘偏差原因 + 信号审核 5 小时节流**（2026-08-17 19:5x）：①`review_all_predictions` 对「方向错 或 幅度偏差 >=0.3%」的基金逐只调 `review_with_ai`（复用现成 prompt）生成 `deviation_reason`，前端 `renderReviewAll` 每行卡片显示「🤖 偏差原因」（放逐只卡片内，总体总结段保留）；**注意：批量复盘从纯算术变逐只调 LLM，会变慢** ②信号自动审核从 60 秒防抖改为 **5 小时节流**：`lastAutoAuditTs` 存 localStorage（重启仍生效，删了原 `lastAutoAudit` 变量）；手动「AI 审核信号」按钮不受限但成功后也会重置计时；空状态文案同步「5 小时内不重复」。**未打包**
+- **预测复盘闭环（方向+幅度）**（2026-08-17 19:5x）：新增 `prediction_lessons.json` 缓存 + `summarize_prediction_lessons`（复盘 worker 完成后自动调：LLM 基于方向正确率+幅度高估/低估统计提炼 3-6 条预测经验教训）+ `build_prediction_review_context`（下次单只/组合分析时拼入 prompt，修正预测方向与预期涨幅）；`build_user_prompt`/`build_portfolio_prompt`/`analyze_fund`/`analyze_portfolio` 均加 `prediction_review_context` 参数，fund_monitor 三处分析入口 + review_all worker 已接通。分析后保存当日预测（`save_prediction`）确认已存在（单只/全部/组合均覆盖写入 analysis_history.json 当日）。**未打包**
+- **幅度偏差率修正值**（2026-08-17 20:0x）：①`summarize_prediction_lessons` 统计升级——**幅度偏差只算「方向判对」的样本**：`bias_pct`=实际-预测均值（修正值，+为系统性低估→下次上调；-为系统性高估→下调）、`avg_abs_dev`=平均绝对偏差（精度）、over/under 计数同样只数方向对样本（阈值 ±0.2%）；stats 字段 `avg_deviation` 改名 `bias_pct`/`avg_abs_dev` ②`build_prediction_review_context` 输出「方向正确率（含降信心提示）+ 偏差率修正指令 + 经验教训」，明确指示 AI 把偏差值加到下次预期涨幅、方向判断参考正确率 ③前端 `renderReviewAll` 顶部统计区新增「幅度偏差率(方向对)」徽章+修正提示，底部说明更新。mock 单测通过（预测2实际4→bias +1.25% 等）。**未打包**
+- **P0 基准对照**（2026-08-17 21:0x）：`review_all_predictions` 新增 `baselines`——对同一批复盘样本同时算 **4 个基线方向正确率**：动量跟涨（今天涨押明天涨，幅度=今天涨跌幅）、均值回归（与今天相反）、历史频率（近20日涨跌孰多）、随机（50%）；**只用预测日当天及以前的数据（防数据泄漏）**；AI 正确率用与基线相同的子集（口径一致）；返回 `excess_vs_best`（超额=AI−最佳基线）；`summarize_prediction_lessons` 把 baselines 存入 stats；`build_prediction_review_context` 喂回「基准对照」段（让 AI 知道相对简单策略强/弱）；前端复盘页新增「📊 基准对照」区块（5 个正确率条 + 超额徽章 + AI/动量幅度偏差对比）。mock 单测通过（2 只样本 ai/mom/rev/br 均 50%、excess 0.0、ai_abs 1.25 vs mom_abs 1.75）。**未打包**
+- **P1 滚动加权 + 信心校准**（2026-08-17 21:1x）：①**偏差率滚动加权**：`prediction_lessons.json` 新增 `history`（保留最近 5 次复盘 stats）+ `rolling`（`_merge_rolling`：权重=样本量×0.7^(rank-1)，最新权重最高，输出加权 bias_pct/avg_abs_dev/方向正确率/总样本数/复盘次数）；`build_prediction_review_context` 优先用 rolling 修正值并标注「近 N 次复盘、共 M 只样本」，避免单次极端行情带偏 ②**confidence 校准**：`review_all_predictions` 返回 `confidence_calibration`（按 AI 自评 高/中/低 分档统计实际方向正确率+样本数+平均准确率，按样本降序）；存入 data 并喂回 prompt（提示"高信心不高于低信心即不可靠"）；前端复盘页新增「📊 信心校准」区块（各档位正确率徽章+样本数）。mock 单测通过（滚动加权 1.25/-0.25 → 0.29 与手算一致；3 次复盘累积 14 样本）。**未打包**
+- **v2.0.9 发版**（2026-08-17 21:15）：上述 6 项改动（复盘偏差原因 / 5 小时节流 / 预测复盘闭环 / 幅度偏差率修正 / P0 基准对照 / P1 滚动加权+信心校准）全部打包替换桌面 exe（26MB，build.py 49s）；deploy_check 冒烟：15s/25s 存活 ✅；**⚠️ 托盘窗口检测返回 False**（v2.0.6 时能检测到 fund_monitor...SystemTrayIcon，本次 EnumWindows 未查到——可能是托盘初始化慢于 25s 检测窗口或检测时序问题，待用户打开 exe 确认托盘；进程存活已确认，脚本仍判定通过）。build/__pycache__ 已清理
+- **预测目标日期锚点 bug 修复**（2026-08-17 22:5x，**未打包**）：原实现预测记录以「分析日」为 key、复盘用 `find_next_pct` 从 key 反推目标日，跨周末/盘前盘后错位（如 18 号盘前分析预测 18 号却存 key=18，复盘 find_next_pct(18)=19 号 → 用 19 号实际复盘"对 18 号的预测"；15/16 号周末分析都落 17 号导致 history 重复累积）。修复：①`compute_forecast_date()`=分析所在日历日的**下一个交易日**，`save_prediction` 自动写入 `forecast_date`（18 号全天分析统一视为对 19 号预测）②`review_all_predictions` 按 `forecast_date` **精确对齐目标日实际**（旧数据无该字段 fallback `find_next_pct`）③`build_user_prompt`/`build_portfolio_prompt` 加日期锚点「今天是 X，请预测下一个交易日 Y 的涨跌」④`summarize_prediction_lessons` 同日复盘**去重**（替换最后一条，不再重复累积滚动样本）。隔离单测通过（save 写 fd=08-18；对齐取 18 号实际；fallback 正常；同日去重 1 条）。**⚠️ 测试曾误污染真实数据文件（已完整恢复：analysis_history 22 只、prediction_lessons 6 lessons/bias 3.09），教训：测 save/summarize 必须把 HISTORY_FILE/PREDICTION_LESSONS_FILE 指向临时目录**。git commit b0394c7；.gitignore 补 prediction_lessons.json
+- **预测目标日分时归属 v2**（2026-08-17 23:0x，**未打包**）：用户澄清——按「对哪天的分析」分情况：**交易日 15:00 前（盘前+盘中）分析 → 预测「当日」**（今天未收盘）；**15:00 后及周末 → 预测「下一交易日」**（与 `nav_date_for_now` 的 15:00 规则一致，正好对上"开盘前后都属于那一天"）。`compute_forecast_date` 分时返回；prompt 锚点措辞分盘中（"预测今日 X"）/盘后（"预测下一个交易日 Y"）；`summarize_prediction_lessons` 的 history **按 forecast_date 归组去重**（同目标日重复复盘只保留一条）。隔离单测通过（周一10:00→fd=17号/20:00→fd=18号/周日→fd=17号；prompt 两种措辞；history 归组=18号）
+- **v2.0.10 发版**（2026-08-17 22:58）：预测目标日期锚点两轮修复（b0394c7 forecast_date 锚定 + 693f53d 分时归属/按目标日归组去重）打包替换桌面 exe（26MB，46s）；deploy_check 冒烟 15s/25s 存活 ✅；**托盘窗口检测仍 False**（与 v2.0.9 相同，疑似 deploy_check 检测时序问题，待用户打开确认）。build/__pycache__ 已清理
+- **加载中金额显示 0/负 bug 修复**（2026-08-17 23:0x，**未打包**）：现象——刚打开 exe 数据未加载时点「金额隐藏」，之后加载出来总资产显示 0、累计收益变负。根因：`_build_state` 在 info 空（gz=None）时 value=0 → total=0+闲钱、cum=value+sold-bought=**-bought 负值**，前端照实渲染（v2.0.5 的 _state_lock 只防并发写坏数据，不防"加载中假数据"）。修复：①`_build_state` 每只基金加 `has_nav` 字段；**任一基金未拿到净值（加载中/估值失败）时 total/profit/realized 置 None**（前端 fmt(null) 显示 '--'，不再 0/负）②前端表格「累计收益」列改为 `f.has_nav&&f.realized?sgn(...):'--'` 拦截假负值。验证：mock 隔离测试——info 空 → total/profit/realized 均 None；加载完成 → total=10000/realized=1000 正常
+- **加减仓复盘目标日锚点**（2026-08-17 23:0x，**未打包**）：对齐预测的 forecast_date 机制——`add_trade_review_from_report` 写入 `forecast_date`（同 compute_forecast_date：交易日 15:00 前=今日、15:00 后及周末=下一交易日），去重按「同基金+同目标日」；`review_trade_reviews` 的 23:00 复盘只选**目标日 ≤ 今天**的建议（即"昨天给的对今天的建议"主场景 + 历史漏网补复盘），对未来的建议提示「对 X 日需等该日收盘后自动复盘」，旧数据无 fd fallback date<today；前端卡片显示「对 X 日」、日期筛选下拉按目标日（fd 优先）。隔离单测通过（对今天/旧数据复盘、对未来跳过并提示）。**未打包**
+- **分析报告复盘联动 + 依据来源**（2026-08-17 23:1x，**未打包**）：此前报告只有「📡 信号联动」、没有复盘经验体现，用户质疑"怎么得出来的没说明"。修复：①后端 analyze_one / analyze_all 把喂给 AI 的两段上下文（`build_trade_review_context` 加减仓复盘 + `build_prediction_review_context` 预测偏差率修正）存入 `result.review_context` 带回前端 ②组合报告（renderFullReport）新增「🧭 复盘联动（结论依据来源）」块，展示加减仓复盘参考 + 预测复盘参考（偏差率修正依据）原文 ③单只报告（renderReport）新增同款「复盘联动」块。今日分析持久化（重启重渲染）无 review_context 时自动不显示，兼容。**未打包**
+- **trade_review 目标日迁移**（2026-08-17 23:1x）：v2.0.10 生成的建议无 forecast_date，导致 16 号（周日）的 6 条建议被旧逻辑错位复盘成"持平 0"。按用户方案迁移数据：①6 条 reviewed（生成日 08-16）→ 重置 pending + `forecast_date=2026-08-17`，**用新逻辑重新 AI 复盘** → 全部盈利（+2.6%~+8.25%，盈利占比 100%，平均 +5.36%）②6 条 pending（生成日 08-17）→ `forecast_date=2026-08-18`，明天 23:00 复盘。经验教训（trade_lessons.json）已随重复盘更新。trade_review.json 为数据文件（gitignore），无代码提交
+- **v2.0.11 发版**（2026-08-17 23:17）：①**所有预测显示加"对 X 日"标注**（7 处：顶部卡片组合预测 / 持仓表格预测列 / 组合报告整体明日预测 / 组合报告单只卡片明日 / 单只报告明日预测标题 / 历史查看组合预测 / 历史查看单只预测）——新增 `fdTxt(fd)` helper，旧数据无 fd 自动不显示；后端 `save_portfolio_prediction` 补 forecast_date、`_build_state` 的 today_pred/portfolio_pred 带 fd、analyze 三处给内存 report 塞 fd ②复盘联动块（43f02fc）、加减仓复盘锚点（752b4d5）、加载中 0/负修复（ea70f6e）一并包含。打包 26MB（43s），冒烟存活 ✅；托盘检测仍 False（待确认）；build/__pycache__ 已清理（沙箱回收站不可用时用 rm -rf）。git a7abeb1
+- **收盘后行情显示官方数据修复**（2026-08-17 23:2x，**未打包**）：用户反馈收盘后 018957 中航机遇领航混合C 显示 5.51% 但实际官方 4.52%。根因：`fetch_batch` 对每只基金无条件调 `_fetch_estimate` 盘中估值链，收盘后（23 点）重仓股加权基于股票收盘价算出估算（5.51）**覆盖了腾讯官方涨跌 p[7]（4.519）**。修复：`fetch_batch` 加 `_in_trading` 判断（开市日 9:30-15:00），**非交易时段（收盘后/盘前/周末）跳过估值链，直接用腾讯官方净值 p[5] 与官方涨跌 p[7]**。实测：收盘后 018957 → 4.519%/est=False ✅；mock 盘中 14:00 仍走估值链 est=True ✅。git 17cadd7
+- **涨幅来源标注**（2026-08-17 23:2x，**未打包**）：涨跌幅旁标注数据来源——`pctTag(f)` helper（主窗口+悬浮窗各一份）：`est=true` → 「预估」；`est=false 且 qdate=今天` → 「收盘」；`est=false 且 qdate≠今天`（昨日数据、今天未开盘）→ 「昨日收盘」。替换原「MM-DD/昨收」小字。git f2dc6ec
+- **v2.0.12 发版**（2026-08-17 23:26）：收盘后官方数据修复（17cadd7）+ 涨幅来源标注（f2dc6ec）打包替换桌面 exe（26MB，45s）；冒烟 15s/25s 存活 ✅；托盘检测仍 False（待用户确认）；build/__pycache__ 已清理。git baa62bb
+- **复盘/历史按目标日聚合**（2026-08-17 23:3x，**未打包**）：用户要求「选择日期=选择对那天的预测，锚点也对那天的预测复盘」。重构：①`_fd_of(pred, dstr)`——预测目标日（forecast_date 优先，旧数据无 fd fallback=分析日后首个交易日）；②`list_forecast_dates()`——所有目标日去重倒序；③`review_all_predictions(fd)`——**按目标日跨分析日聚合**（17号收盘后与18号盘中"对18号"的预测合并复盘），实际=fd 当天官方净值，基线用各自分析日数据防泄漏；④`review_prediction/review_with_ai/review_portfolio` 支持直接传预测记录；⑤前端复盘页下拉「对 X 日」、历史列表「对 X 日的预测」、复盘标题/按钮/准确率卡片文案全部对齐目标日。隔离单测通过（对18号聚合 A+B、对17号聚合 C+X、实际对齐 fd、目标日列表正确）。git 633b400
+- **加减仓复盘 T+N 净值新鲜度校验**（2026-08-17 23:4x，**未打包**）：用户反馈 QDII（如 457001 国富亚洲）净值滞后 1-2 天（实测腾讯 p[8]=08-14 而今天 08-17），复盘用滞后净值会算出错误盈亏。规则：`review_trade_reviews` 复盘每条前校验 `当前行情净值日期(qdate) ≥ 建议目标日(fd)`——不满足则跳过（保持 pending），标记「净值未更新（当前净值日期 X 早于目标日 Y，T+N 滞后），待更新后自动复盘」；国内基金 qdate=fd 正常复盘。mock 单测通过（国内复盘/QDII 跳过）。**另确认：组合预测已挂钩信号库(55条)+加减仓复盘+预测复盘上下文，用户看到的 1.5 是复盘数据生成前的旧分析（今日分析持久化），重新分析即生效**。git 884cdb6
+- **v2.0.13 发版**（2026-08-17 23:41）：目标日聚合复盘（633b400）+ T+N 净值新鲜度校验（884cdb6）打包替换桌面 exe（26MB，44s）；冒烟 15s/25s 存活 ✅；托盘检测仍 False（待用户确认）；build/__pycache__ 已清理。git 58122fb
+
+## 远端 v2.0.1→v2.0.5 进度（2026-08-17 拉取同步，来自 GitHub main 分支 30 commits）
+- **v2.0.1（09:56）**：`build.py` 一键构建脚本（建 venv+装依赖+打包 exe）、`requirements.txt`（pywebview 锁 5.4）、`.gitignore` 排除 .venv；悬浮窗 DPI 缩放修复（物理/逻辑像素混用→兼容缩放+坐标防越界）；悬浮窗列表排序（先涨幅再占比，get_state 加 ratio 字段）；README 加「从源码构建」一节；**GitHub Actions 自动打包**（push v* tag → PyInstaller → 上传 Release）
+- **v2.0.2 / v2.0.3（10:53）**：**代理设置**（`proxy_config.json`，fund_monitor 与 fund_analysis 共用）+ 盘中估值指数近似兜底（跟踪标的实时行情估算，适应第三方源被屏蔽的网络）
+- **v2.0.4（12:06）**：**主动基金重仓股加权估算**——用 2026Q2 季报前十大重仓股实时涨跌按权重加权，替代单指数套用（覆盖率不足 100% 时按已有重仓股外推）
+- **v2.0.5（16:08）**：①**自定义模型配置**：设置可填 API 地址/Key/模型名，支持任意 OpenAI 兼容接口 ②悬浮窗收起定位修复（SPI_GETWORKAREA 避开任务栏）③开机自启开关（注册表 Run 键）+默认收起+默认隐藏金额（`ui_config.json` 持久化）④今日分析持久化：重启后自动恢复当天分析报告 ⑤并发锁：修复加载中切换金额隐藏导致数据错乱
+- Releases：v2.0.1~v2.0.5 共 5 个 exe 成品（约 21MB，`FundMonitor-vX.Y.Z.exe`）
 - 待办（用户未确认）：`compute_risk_metrics` 重复定义（第二版覆盖第一版 → beta/alpha 永远 None）；按钮整合；逻辑证伪复盘
 
-## 协作省 token 约定（用户偏好）
+## 协作省 token 约定（用户偏好，必须遵守）
 - 小改动：直接告诉用户改哪一行，尽量不打包
 - 攒 2-3 个需求再打包一次
 - 触发：用户说「基金监控项目」时，先读本文件接续开发
+- **排错类任务：先问 1-2 个关键问题定位，再动手，不盲目枚举窗口/进程**
+- **打包部署：一律走 fund-monitor-build skill 的 deploy_check.py，不再手写冒烟脚本**
+- **读大文件：优先用模块地图（MODULE_MAP.md 等）精准定位，单次 Read 只取目标区间，不整读 180KB 文件**
+- **冒烟测试没必要：打包部署后由用户自己打开 exe 验证，不自动启动 exe 做存活检测**
