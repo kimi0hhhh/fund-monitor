@@ -3,6 +3,7 @@ build/
 dist/
 __pycache__/
 *.spec.bak
+*.exe
 
 # 运行时数据（含个人持仓与 API key，绝不提交）
 funds_data.json
@@ -13,6 +14,8 @@ analysis_history.json
 signals.json
 trade_review.json
 trade_lessons.json
+prediction_lessons.json
+ui_config.json
 
 # 系统文件
 Thumbs.db
