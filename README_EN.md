@@ -1,7 +1,7 @@
 # Fund Monitor · Complete User Guide
 
 > A local desktop tool for fund portfolio tracking + AI investment research. All data stays on your machine — your holdings are never uploaded anywhere.
-> Applies to: v2.0 (exe builds released on or after 2026-08-17)
+> Applies to: v2.0.13 (exe builds released on or after 2026-08-17)
 >
 > **中文版: [README.md](README.md)**
 
@@ -99,6 +99,8 @@ The main window has two areas:
 
 - **Sorting**: click any column header for multi-level sorting (name / change / amount / P&L / shares / NAV, etc.)
 - **Weight column**: shows position weight; over 30% displays an orange "集中" (concentrated) warning
+- **Change source tag**: next to each change % — "**预估**" (estimated, intraday), "**收盘**" (official close, NAV date = today), or "**昨日收盘**" (yesterday's close, today not yet open)
+- **Official data after close**: the intraday estimate fallback chain only runs during trading hours (9:30-15:00); **after close / weekends the official NAV and change are used directly** (never overwritten by estimates)
 - **Auto refresh**: every 30 seconds; or click "立即刷新" (Refresh)
 
 ---
@@ -184,6 +186,7 @@ Header buttons:
   3. Pure HOLD
   4. Failed analysis
   - Within a tier: confidence descending → amount descending
+- **Review-linkage (basis of conclusions)**: the report shows a "🧭 复盘联动" block listing the **trade-advice review experience** (profit ratio / bias types / lessons) and the **prediction-review corrections** (direction accuracy / bias correction / baseline comparison / confidence calibration) that this analysis referenced — so you can see exactly how the conclusions were derived; a "📡 信号联动" block shows referenced historical signals and win rate
 
 ### 7.3 Risk metrics (per-fund)
 
@@ -197,14 +200,24 @@ Header buttons:
 ## 8. Prediction Review
 
 1. "分析" → "**复盘**" (Review) tab
-2. Pick a prediction date → click "**📋 复盘当天全部**" (Review all)
-3. Automatically compares that day's predictions vs actual changes:
+2. **Pick a prediction target day** (dropdown shows "对 08-18 日") → click "**📋 复盘对所选日的全部预测**" (Review all predictions for the selected day)
+   - Review is anchored to the **target day**: every prediction records `forecast_date` (analysis before 15:00 on a trading day → targets that day; after 15:00 or weekends → the next trading day)
+   - **Cross-day aggregation**: predictions for the same target day may come from different analysis days (e.g. both the 17th evening and 18th intraday predict the 18th) — they are merged into one review
+3. Compares predictions vs **official closing change** for that target day:
    - Direction correct? (UP/DOWN/FLAT vs actual)
    - Magnitude deviation
    - **Composite accuracy (0-100)**: 50 points for correct direction; +50 if magnitude error <0.3%, +30 if <0.6%
    - Portfolio actual change (market-value-weighted)
-   - **AI deviation analysis**: why the prediction missed, and improvement suggestions
-4. The "历史预测" (History) tab lists all analyzed dates and details
+   - **Per-fund AI deviation analysis** for every fund with a deviation (wrong direction or magnitude ≥0.3%)
+4. Four stat blocks at the top of the review result:
+   - **Direction accuracy / average accuracy / magnitude bias** (only direction-correct samples; actual − predicted mean; positive = systematic underestimation)
+   - **Baseline comparison**: AI accuracy vs momentum-follow / mean-reversion / base-rate / random baselines (only data up to each analysis day, no leakage) + excess accuracy
+   - **Confidence calibration**: actual accuracy per AI self-rated confidence tier (high/medium/low)
+5. **Closed loop (auto-fed to next analysis)**: after review, lessons are distilled; every subsequent analysis automatically carries:
+   - Direction accuracy + magnitude bias correction (e.g. +3.09% → instructs the AI to raise its expected change)
+   - **Rolling correction** (last 5 reviews × sample size × time-decay weighted, avoiding single extreme days skewing the value)
+   - Baseline comparison + confidence calibration + lessons
+6. The "历史预测" (History) tab lists **target days** ("对 X 日的预测") with cross-day aggregation
 
 ---
 
@@ -213,7 +226,7 @@ Header buttons:
 - "分析" → "**信号**" (Signals) tab
 - AI generates trackable signals during analysis (e.g. "breakout above key level, bullish"); deduplicated (same fund + direction + target keeps one)
 - **Status badges**: active / strengthened / weakened / realized / falsified
-- **AI auto-audit**: opening the Signals page audits active signals, classifying them as:
+- **AI auto-audit**: opening the Signals page audits active signals (**no auto re-audit within 5 hours, persists across restarts**; the manual "AI 审核信号" button is never throttled), classifying them as:
   - Realized (correct) / Falsified (wrong) / Strengthened / Weakened / Maintained / Insufficient info
 - **Win-rate stats**: 4 tiles (total / active / closed / hit rate)
 - Supports **deleting individual signals** and **clearing all**
@@ -236,7 +249,8 @@ Header buttons:
 
 ### 10.1 How advice is collected
 
-- After every "Today" or portfolio analysis, if the AI gives a **non-hold** action (Buy/Add/Sell/Reduce), it is automatically stored in the "加减仓复盘" (Trade Review) library (only the latest record per fund per day).
+- After every "Today" or portfolio analysis, if the AI gives a **non-hold** action (Buy/Add/Sell/Reduce), it is automatically stored in the "加减仓复盘" (Trade Review) library (only the latest record per fund **per target day**)
+- Advice also carries a **target-day anchor** (`forecast_date`, same rule as predictions): before 15:00 → targets that day; after 15:00 or weekends → the next trading day. Cards show "生成日 · 对 08-18 日"
 
 ### 10.2 When auto-review happens
 
@@ -246,7 +260,8 @@ Review runs **only on trading days** and **after the day's NAV is finalized**:
 |---|---|
 | Today is a trading day | Determined via the CSI 300 index quotes; weekends **and public holidays** do not count |
 | Time ≥ 23:00 | Fund NAV usually updates in the evening; data is only reliable after 23:00 |
-| Advice date < today | Same-day advice is **not reviewed on the same day**; waits for the next trading day |
+| Advice target day ≤ today | **Only reviews advice targeting today or earlier** — "yesterday's advice for today" is reviewed that night; "advice for tomorrow" waits until its target day closes |
+| NAV freshness | Before reviewing, verifies current NAV date ≥ target day: **QDII / T+N funds with lagged NAV (1-2 days) are skipped**, marked "净值未更新…待更新后自动复盘", and re-reviewed automatically once NAV catches up — avoids wrong P&L from stale NAV |
 
 **Triggers**:
 - App running: a 23:00 timer is set at startup; auto-review fires once at that time
@@ -254,9 +269,10 @@ Review runs **only on trading days** and **after the day's NAV is finalized**:
 - Opening the "加减仓复盘" page: auto-checks and triggers (60s debounce)
 
 **Examples**:
-- Advice from Saturday → auto-reviewed after Monday 23:00 ✅
-- Advice from Friday intraday → not reviewed same day; reviewed after Monday 23:00 ✅
+- Advice from Saturday (targeting Monday) → auto-reviewed after Monday 23:00 ✅
+- Advice from Friday intraday (targeting Friday) → reviewed Friday 23:00 ✅
 - Computer off at Friday 23:00 → caught up on Monday 23:00 (advice is never lost, only deferred) ✅
+- Monday-evening advice targeting Tuesday → reviewed Tuesday 23:00; QDII with lagged NAV auto-waits until NAV updates ✅
 
 ### 10.3 Review contents
 
@@ -280,7 +296,7 @@ After review completes automatically:
 
 ### 10.5 Page features
 
-- **Date filter**: top dropdown filters records by date (All + advice dates descending)
+- **Date filter**: top dropdown filters by **target day** (All + target days descending; cards show "生成日 · 对 X 日")
 - **Status hint**: shows "market closed today / NAV not yet finalized" etc. in real time
 - **Lessons block**: top of the page shows the cached lessons (with generation date)
 - **Stats**: total advice / reviewed / profit ratio / average return
