@@ -108,11 +108,18 @@ def _f(v):
 
 
 def _screen_size():
-    """返回屏幕工作区尺寸 (宽, 高)，失败回退 1920x1080"""
+    """返回屏幕尺寸（逻辑像素，兼容 DPI 缩放）；失败回退 1920x1080"""
     try:
         import ctypes
         user32 = ctypes.windll.user32
-        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        w = user32.GetSystemMetrics(0)
+        h = user32.GetSystemMetrics(1)
+        try:
+            # 物理像素 ÷ 缩放因子 = 逻辑像素（GetScaleFactorForDevice: 0=主显示器, 100/125/150...）
+            scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+        except Exception:
+            scale = 1.0
+        return max(1, int(round(w / scale))), max(1, int(round(h / scale)))
     except Exception:
         return 1920, 1080
 
@@ -809,11 +816,14 @@ class Api:
             self._float_collapsed = not self._float_collapsed
             sw, sh = _screen_size()
             if self._float_collapsed:
-                w.resize(260, 72)
-                w.move(sw - 260 - 14, sh - 72 - 14)
+                cw, ch = 260, 72
             else:
-                w.resize(320, 460)
-                w.move(sw - 320 - 14, sh - 460 - 14)
+                cw, ch = 320, 460
+            w.resize(cw, ch)
+            # 坐标防越界：DPI 缩放/多显示器下避免窗口飞出屏幕外（移出后点不到展开按钮，表现为"无响应"）
+            x = max(0, sw - cw - 14)
+            y = max(0, sh - ch - 14)
+            w.move(x, y)
             return {"ok": True, "collapsed": self._float_collapsed}
         except Exception as e:
             self._float_collapsed = not self._float_collapsed
