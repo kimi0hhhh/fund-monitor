@@ -1741,7 +1741,11 @@ class Api:
         }
 
     def get_today_analysis(self):
-        """返回今天已保存的分析结果（重启后可重新渲染，实现"今日分析留在上面"）"""
+        """返回今天已保存的分析结果（重启后可重新渲染，实现"今日分析留在上面"）
+
+        恢复时重建「量化配置 / 信号联动 / 复盘联动」三个区块，与分析完成时的
+        完整展示保持一致——否则重启后只显示基础逐只分析，看起来像"旧版本的分析"。
+        """
         if fa is None:
             return {"ok": False, "msg": "fund_analysis 模块未加载"}
         today = datetime.now().strftime("%Y-%m-%d")
@@ -1757,6 +1761,37 @@ class Api:
             name = (self.data.get(code, {}).get("name")
                     or self.info.get(code, {}).get("name") or code)
             results.append({"ok": True, "code": code, "name": name, "report": pred})
+        # ---- 重建完整版联动区块（与 analyze_all 展示一致） ----
+        allocation = signal_summary = review_context = None
+        try:
+            funds = []
+            for code, d in self.data.items():
+                info = self.info.get(code, {})
+                gz = info.get("gz")
+                shares = d.get("shares", 0) or 0
+                funds.append({"code": code, "name": d.get("name") or info.get("name") or code,
+                              "value": shares * gz if shares and gz else 0,
+                              "gz_pct": info.get("gz_pct")})
+            allocation = fa.compute_allocation(funds, self.idle_cash)
+        except Exception:
+            pass
+        try:
+            sigs = fa.load_signals()
+            sig_closed = [s for s in sigs if s.get("status") in ("兑现", "证伪")]
+            sig_active = [s for s in sigs if s.get("status") in ("active", "强化", "弱化")]
+            sig_correct = sum(1 for s in sigs if s.get("outcome") == "correct")
+            signal_summary = {
+                "total": len(sigs), "active": len(sig_active), "closed": len(sig_closed),
+                "correct": sig_correct,
+                "hit_rate": round(sig_correct / len(sig_closed) * 100, 1) if sig_closed else None,
+            }
+        except Exception:
+            pass
+        try:
+            review_context = {"trade": fa.build_trade_review_context(),
+                              "prediction": fa.build_prediction_review_context()}
+        except Exception:
+            pass
         return {
             "ok": True,
             "has": True,
@@ -1765,6 +1800,9 @@ class Api:
             "results": results,
             "ok_count": len(results),
             "total": len(results),
+            "allocation": allocation,
+            "signal_summary": signal_summary,
+            "review_context": review_context,
             "analyzed_at": today,
         }
 
