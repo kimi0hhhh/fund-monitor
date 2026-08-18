@@ -553,7 +553,8 @@ def _platt_fit(samples):
 def apply_posthoc_calibration(report, metrics=None):
     """后处理校准（机械式，不依赖 LLM 自律）——比 prompt 提示可靠的偏差修正：
     1. 幅度修正：expected_pct += rolling.bias_pct（方向对时的系统性偏差，无条件机械修正）
-    2. 降级到动量：AI 方向正确率不跑赢动量基线(excess<=0)时，方向覆盖为 12-1 月动量方向
+    2. 方向择优覆盖：AI 滚动正确率跑不过最优基线时，方向覆盖为最优基线方向；
+       冷启动（无滚动统计）兜底均值回归；FLAT 基线不覆盖
     3. 信心校准：confidence_score 用 Platt scaling 参数重算为真实正确概率
     4. 区间预测：加 pred_interval = [修正后 ± conformal_q90]
     返回校准后的 report（就地修改并返回）。
@@ -576,17 +577,43 @@ def apply_posthoc_calibration(report, metrics=None):
             tf["expected_pct"] = round(raw_pct + bias, 2)
             calib["expected_pct_raw"] = raw_pct
             calib["bias_applied"] = bias
-    # 2. 降级到动量（单只，AI 不跑赢动量基线时）
-    exc = (stats.get("baselines") or {}).get("excess_vs_best")
-    if isinstance(tf, dict) and exc is not None and exc <= 0 and metrics:
-        mom_dir = metrics.get("momentum_12_1_dir")
+    # 2. 方向择优覆盖（单只）：
+    #    基线方向映射 momentum→momentum_12_1_dir / reversal→reversal_dir / base→hist_freq_dir。
+    #    决策：有滚动统计时，AI 滚动方向正确率 < 最优基线滚动正确率 → 覆盖为最优基线方向；
+    #          冷启动（无滚动统计）→ 兜底均值回归（65 天回测唯一稳定过 50% 的基线）；
+    #          FLAT 基线不覆盖（平盘方向在复盘里极难命中，覆盖成平盘等于主动送错）。
+    if isinstance(tf, dict) and metrics:
         ai_dir = str(tf.get("direction", "")).upper()
-        if mom_dir in ("UP", "DOWN") and ai_dir in ("UP", "DOWN") and ai_dir != mom_dir:
-            calib["direction_raw"] = ai_dir
-            tf["direction"] = mom_dir
-            calib["momentum_override"] = True
-            if tf.get("reason"):
-                tf["reason"] = "%s（方向已按动量基线修正）" % tf["reason"]
+        rolling_dir_rate = rolling.get("direction_correct_rate")
+        best_bl = rolling.get("best_baseline")
+        best_bl_rate = rolling.get("best_baseline_rate")
+        baseline_dir = {
+            "momentum": metrics.get("momentum_12_1_dir"),
+            "reversal": metrics.get("reversal_dir"),
+            "base": metrics.get("hist_freq_dir"),
+        }
+        baseline_names = {"momentum": "动量基线", "reversal": "均值回归基线", "base": "历史频率基线"}
+        override_key = None
+        override_tag = ""
+        if best_bl and best_bl_rate is not None:
+            # 有基线滚动统计：AI 跑不过最优基线才覆盖
+            if rolling_dir_rate is None or rolling_dir_rate < best_bl_rate:
+                override_key = best_bl
+                override_tag = "择优覆盖（最优基线）"
+        else:
+            # 无基线统计（冷启动，或旧数据尚未生成 baseline_rates）→ 兜底均值回归（回测最强）
+            override_key = "reversal"
+            override_tag = "兜底均值回归"
+        if override_key:
+            bdir = baseline_dir.get(override_key)
+            if bdir in ("UP", "DOWN") and ai_dir in ("UP", "DOWN", "FLAT") and ai_dir != bdir:
+                calib["direction_raw"] = ai_dir
+                tf["direction"] = bdir
+                calib["override_baseline"] = override_key
+                calib["override_reason"] = override_tag
+                if tf.get("reason"):
+                    tf["reason"] = "%s（方向已按%s修正）" % (
+                        tf["reason"], baseline_names.get(override_key, override_key))
     # 3. 信心校准（Platt scaling）
     platt = stats.get("platt")
     if platt and report.get("confidence_score") is not None:
@@ -718,6 +745,16 @@ def compute_metrics(history):
         else:
             momentum_12_1_dir = "FLAT"
 
+    # 最近已收盘日方向（均值回归基线用）：last_pct_dir → reversal_dir 取反
+    last_pct = pcts[-1] if pcts else 0
+    last_pct_dir = "UP" if last_pct > 0.05 else ("DOWN" if last_pct < -0.05 else "FLAT")
+    reversal_dir = {"UP": "DOWN", "DOWN": "UP", "FLAT": "FLAT"}.get(last_pct_dir)
+    # 近 20 日涨跌频率方向
+    recent20 = pcts[-20:]
+    _ups = sum(1 for p in recent20 if p > 0.05)
+    _downs = sum(1 for p in recent20 if p < -0.05)
+    hist_freq_dir = "UP" if _ups > _downs else ("DOWN" if _downs > _ups else "FLAT")
+
     return {
         "last_nav": last,
         "ma5": ma5, "ma10": ma10, "ma20": ma20,
@@ -735,6 +772,9 @@ def compute_metrics(history):
         "max_consec_down_days": max_down_days,
         "cond_vol_1d": cond_vol_1d,
         "momentum_12_1_dir": momentum_12_1_dir,
+        "last_pct_dir": last_pct_dir,
+        "reversal_dir": reversal_dir,
+        "hist_freq_dir": hist_freq_dir,
     }
 
 
@@ -874,18 +914,23 @@ def _next_trading_day(d):
 
 
 def compute_forecast_date():
-    """预测目标交易日（分盘中/盘后）：
+    """预测目标交易日（对齐「成交日次日」语义，供操作决策参考）：
 
-    - 交易日 15:00 前（盘前 0:00 至盘中 14:59）：当天还没收盘 → 预测「今日」当天涨跌
-    - 交易日 15:00 后 / 周末：当天已收盘或休市 → 预测「下一个交易日」
+    - 交易日 15:00 前（盘前 0:00 至盘中 14:59）：今天 15:00 前仍可操作，
+      成交价=今日净值、收益起点=下一交易日 → 预测「下一交易日」（明天）
+    - 交易日 15:00 后 / 周末：最早下一交易日 15:00 前才能操作，
+      成交价=下一交易日净值、收益起点=下下个交易日 → 预测「下下个交易日」（后天）
 
-    关键语义：预测锚定「对哪一天预测」（目标日）。17 号盘前/盘中分析 → 对 17 号；
-    17 号收盘后分析 → 对 18 号。复盘按目标日精确对齐，避免跨日错位。
+    关键语义：预测的是「操作成交日的次日」——15:00 前操作按 T 日净值成交、
+    盈亏从 T+1 开始算，所以预测 T+1（明天）才对买卖有指导；预测 T 日（成交价）无用。
+    复盘按目标日精确对齐（review_all_predictions 跨分析日聚合），
+    每天至少分析一次（盘中或盘后）即可保证每个目标日都有预测可复盘。
     """
     now = datetime.now()
     if now.weekday() < 5 and now.hour < 15:
-        return now.strftime("%Y-%m-%d")
-    return _next_trading_day(now).strftime("%Y-%m-%d")
+        return _next_trading_day(now).strftime("%Y-%m-%d")
+    nxt = _next_trading_day(now)
+    return _next_trading_day(nxt).strftime("%Y-%m-%d")
 
 
 def save_prediction(date_str, code, prediction):
@@ -1019,8 +1064,9 @@ def save_trade_reviews(reviews):
 def add_trade_review_from_report(code, name, report, nav=None, pct=None):
     """从分析报告提取加减仓建议（非 HOLD/维持）存入复盘库
 
-    锚点：与预测一致的 forecast_date（目标日）——交易日 15:00 前分析 → 对今日的建议；
-    15:00 后及周末 → 对下一交易日的建议。23:00 复盘只复盘"对今天"的建议。
+    锚点：与预测一致的 forecast_date（目标日）——交易日 15:00 前分析 → 对下一交易日的建议；
+    15:00 后及周末 → 对下下个交易日的建议（成交日次日语义，见 compute_forecast_date）。
+    23:00 复盘只复盘"目标日 ≤ 今天"的建议。
     去重：同一基金 + forecast_date 已有 pending 记录则不重复添加（同目标日只留最新一条）。
     """
     act = (report or {}).get("action_suggestion") or {}
@@ -1381,9 +1427,9 @@ def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, la
     _today = _now.strftime("%Y-%m-%d")
     _fd = compute_forecast_date()
     if _now.weekday() < 5 and _now.hour < 15:
-        _date_note = f"今天是 {_today}（交易中，尚未收盘），请预测今日 {_today} 的涨跌方向与预期涨幅"
+        _date_note = f"今天是 {_today}（交易中，15:00 前操作按今日净值成交、盈亏从下一交易日算），请预测下一交易日 {_fd} 的涨跌方向与预期涨幅（这是你操作后真正能吃到的一天）"
     else:
-        _date_note = f"今天是 {_today}（已收盘），请预测下一个交易日 {_fd} 的涨跌方向与预期涨幅"
+        _date_note = f"今天是 {_today}（已收盘，最早下一交易日 15:00 前才能操作），请预测下下个交易日 {_fd} 的涨跌方向与预期涨幅（即你操作成交日之后的那一天）"
     parts = [
         f"基金代码: {code}",
         f"基金名称: {name}",
@@ -1592,9 +1638,9 @@ def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_rev
     _today = _now.strftime("%Y-%m-%d")
     _fd = compute_forecast_date()
     if _now.weekday() < 5 and _now.hour < 15:
-        _date_note = f"今天是 {_today}（交易中，尚未收盘），请预测今日 {_today} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_today} 当日涨跌幅）"
+        _date_note = f"今天是 {_today}（交易中，15:00 前操作按今日净值成交、盈亏从下一交易日算），请预测下一交易日 {_fd} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_fd} 当日涨跌幅）"
     else:
-        _date_note = f"今天是 {_today}（已收盘），请预测下一个交易日 {_fd} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_fd} 当日涨跌幅）"
+        _date_note = f"今天是 {_today}（已收盘，最早下一交易日 15:00 前才能操作），请预测下下个交易日 {_fd} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_fd} 当日涨跌幅）"
     parts = ["以下是用户当前的全部持仓（共 %d 只基金，总市值 %.2f 元）：" % (len(funds), total),
              _date_note]
     if market_context:
@@ -2135,7 +2181,8 @@ ROLLING_DECAY = 0.7      # 时间衰减：最近一次权重 1.0，前一次 0.7
 
 def _merge_rolling(history):
     """对最近 N 次复盘的 stats 做滚动加权（权重 = 样本量 × 0.7^(距今天数)），
-    返回 {bias_pct, avg_abs_dev, direction_correct_rate, total_sample, n_reviews}"""
+    返回 {bias_pct, avg_abs_dev, direction_correct_rate, total_sample, n_reviews,
+          baseline_rates, best_baseline, best_baseline_rate}"""
     w_bias = s_bias = w_dev = s_dev = w_rate = s_rate = 0.0
     for i, rec in enumerate(history):
         rank = len(history) - i                      # 最新 rank=1
@@ -2149,12 +2196,36 @@ def _merge_rolling(history):
         if rec.get("direction_correct_rate") is not None:
             w_rate += w
             s_rate += rec["direction_correct_rate"] * w
+    # 滚动各基线方向正确率（权重 = 基线样本量 × 衰减，只用有基线样本的 rec）
+    # 基线字段名 → 指标名映射：momentum→momentum_rate / reversal→reversal_rate / base→base_rate
+    baseline_rates = {}
+    best_baseline = None
+    best_rate = None
+    for key, field in (("momentum", "momentum_rate"), ("reversal", "reversal_rate"), ("base", "base_rate")):
+        wk = sk = 0.0
+        for i, rec in enumerate(history):
+            bl = rec.get("baselines") or {}
+            n = bl.get("sample")
+            rate = bl.get(field)
+            if not n or rate is None:
+                continue
+            rank = len(history) - i
+            wk += n * (ROLLING_DECAY ** (rank - 1))
+            sk += rate * n * (ROLLING_DECAY ** (rank - 1))
+        r = round(sk / wk, 1) if wk else None
+        baseline_rates[key] = r
+        if r is not None and (best_rate is None or r > best_rate):
+            best_rate = r
+            best_baseline = key
     return {
         "bias_pct": round(s_bias / w_bias, 2) if w_bias else None,
         "avg_abs_dev": round(s_dev / w_dev, 2) if w_dev else None,
         "direction_correct_rate": round(s_rate / w_rate, 1) if w_rate else None,
         "total_sample": sum(r.get("reviewed") or 0 for r in history),
         "n_reviews": len(history),
+        "baseline_rates": baseline_rates,
+        "best_baseline": best_baseline,
+        "best_baseline_rate": best_rate,
     }
 
 
@@ -2200,6 +2271,22 @@ def build_prediction_review_context():
             f"滚动修正（近 {rolling.get('n_reviews')} 次复盘、共 {rolling.get('total_sample')} 只样本）："
             f"加权偏差率 {rb_txt} → {rb_advice}；加权方向正确率 {rolling.get('direction_correct_rate', '-')}%，"
             f"加权平均绝对偏差 {rolling.get('avg_abs_dev', '-')}%（样本量越大越可信）")
+    # 滚动最优基线：方向预测会被系统按「AI vs 最优基线」择优覆盖，
+    # 让 AI 知道当前谁最准、自己是否会被覆盖，生成方向时先参考最优基线的逻辑
+    baseline_rates = rolling.get("baseline_rates") or {}
+    if baseline_rates:
+        bnames = {"momentum": "动量", "reversal": "均值回归", "base": "历史频率"}
+        br_txt = " / ".join(f"{bnames.get(k, k)} {v}%" for k, v in baseline_rates.items() if v is not None)
+        best_bl = rolling.get("best_baseline")
+        best_txt = bnames.get(best_bl, best_bl) if best_bl else "无"
+        ai_rate = rolling.get("direction_correct_rate")
+        over = (ai_rate is not None and rolling.get("best_baseline_rate") is not None
+                and ai_rate >= rolling["best_baseline_rate"])
+        lines.append(
+            f"滚动基线正确率（近 {rolling.get('n_reviews')} 次复盘）：{br_txt}；当前最优基线 = {best_txt}。"
+            f"你的滚动方向正确率 {ai_rate if ai_rate is not None else '-'}%，"
+            f"{'已跑赢最优基线，方向采用你的判断' if over else '低于最优基线，方向会由系统覆盖为最优基线方向'}。"
+            f"生成方向时请优先参考最优基线的方向逻辑。")
     # 基准对照：AI 是否真的强于简单策略（动量跟涨/均值回归/历史频率/随机）
     bl = stats.get("baselines") or {}
     if bl.get("sample"):
@@ -2223,3 +2310,270 @@ def build_prediction_review_context():
     if lessons:
         lines.append("预测经验教训：" + "；".join(lessons))
     return "\n".join(lines)
+
+# ================== 中长期分析模块 ==================
+# 独立于「分析」（次日预测），面向 20 个交易日（约 1 个月）的中长期趋势与复盘。
+# 数据文件：midterm.json（结构：{目标日: {analyzed_at, horizon_days, funds{code:{...}}, portfolio, status, review}}）
+
+MIDTERM_FILE = "midterm.json"
+MIDTERM_HORIZON_DAYS = 20   # 目标日 = 分析日起 20 个交易日后（约 1 个月）
+
+
+def _midterm_path():
+    return os.path.join(BASE_DIR, MIDTERM_FILE)
+
+
+def load_midterm():
+    try:
+        if os.path.exists(_midterm_path()):
+            with open(_midterm_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_midterm(data):
+    _atomic_write_json(_midterm_path(), data or {})
+
+
+def compute_midterm_target_date():
+    """中长期目标日：今天起第 20 个交易日（约 1 个月），用于锚定复盘"""
+    d = datetime.now()
+    for _ in range(MIDTERM_HORIZON_DAYS):
+        d = _next_trading_day(d)
+    return d.strftime("%Y-%m-%d")
+
+
+MIDTERM_SYSTEM_PROMPT = """你是一名资深基金中长期策略师。用户需要的是【约 1 个月（20 个交易日）】的中长期判断，不是次日预测。
+
+任务：基于每只基金的历史净值、技术指标、持仓穿透与市场环境，输出结构化 JSON 中长期分析。
+
+要求：
+1. 只输出 JSON，不要 markdown 代码块标记或额外文字。
+2. 严格按以下 schema 输出，不要遗漏字段：
+3. 判断周期明确为「未来 20 个交易日（约 1 个月）」，不要写次日。
+4. target_range 必须是具体的净值区间（用数字，参考当前净值给出，如 "3.20-3.45"）。
+5. 每只基金的字段要具体、可执行、可复盘：预期收益率用 % 数字，止盈止损用净值数字，分阶段计划写清第几个交易日前后的操作。
+
+{
+  "summary": "组合整体中长期一句话总结（40 字内）",
+  "portfolio_trend": "组合整体中长期趋势（偏多/偏空/震荡）",
+  "portfolio_position": "组合整体仓位建议（如 维持7成 / 降至5成 / 分批加至8成）",
+  "sector_advice": [
+    {"sector": "板块名", "action": "加仓/减仓/维持", "reason": "一句话理由", "suggest_pct": "建议调整幅度（如 +10% / -15%）"}
+  ],
+  "funds": {
+    "基金代码": {
+      "trend": "该基金中长期趋势（偏多/偏空/震荡）",
+      "target_range": "预期 20 个交易日后的净值区间（如 3.20-3.45）",
+      "expected_ret": "预期 20 个交易日收益率（%，如 +6.5 / -3.2）",
+      "key_levels": "中期关键位（支撑/阻力净值）",
+      "stop_loss": "止损位（净值，如 2.95）",
+      "take_profit": "止盈位（净值，如 3.45）",
+      "position_advice": "该基金仓位建议（如 维持/加仓/减仓 及幅度）",
+      "phase_plan": "分阶段操作计划（如：前10日持有，突破3.30后加仓，第15日左右视情况减仓）",
+      "key_drivers": ["主要驱动 1", "驱动 2"],
+      "confidence": "高 / 中 / 低",
+      "reason": "依据（80 字内，结合趋势/基本面/风险）"
+    }
+  },
+  "key_risks": ["组合主要中长期风险 1", "风险 2"],
+  "key_catalysts": ["潜在中长期催化 1", "催化 2"]
+}
+"""
+
+
+def build_midterm_prompt(funds, market_context=None):
+    """组装中长期分析 prompt：给每只基金的历史走势 + 技术指标 + 持仓穿透"""
+    total = sum(f.get("value", 0) or 0 for f in funds) or 1.0
+    parts = ["以下是用户当前全部持仓（共 %d 只，总市值 %.2f 元），请给出未来 20 个交易日（约 1 个月）的中长期分析。" % (len(funds), total)]
+    if market_context:
+        parts += ["", "【市场环境】", market_context]
+    parts += [""]
+    for f in funds:
+        m = f.get("metrics") or {}
+        name = f.get("name") or f.get("code")
+        parts.append(
+            f"【{f.get('code')} {name}】持仓市值 {f.get('value', 0) or 0:.0f} 元，"
+            f"当前估算涨幅 {f.get('gz_pct', '-')}%；"
+            f"近 60 日累计收益 {m.get('momentum_12_1_dir', '-')}（12-1月动量方向），"
+            f"波动率(年化) {m.get('volatility_annual', '-')}%，"
+            f"最大回撤 {m.get('max_drawdown', '-')}%，"
+            f"Sharpe {m.get('sharpe', '-')}，VaR95 {m.get('var95', '-')}%。"
+            f"前十大持仓：{(f.get('holdings') or '暂无')}"
+        )
+    parts += ["", "请输出完整 JSON。"]
+    return "\n".join(parts)
+
+
+def analyze_midterm(funds, progress_cb=None):
+    """全部持仓中长期分析（约 1 个月），返回 {ok, target_date, result, msg}
+
+    funds: [{code, name, value, gz_pct, metrics, holdings}]
+    """
+    if not funds:
+        return {"ok": False, "msg": "暂无持仓"}
+    if progress_cb:
+        progress_cb("拉取市场环境...", 10)
+    try:
+        market_context = build_market_context(fetch_market_snapshot())
+    except Exception:
+        market_context = None
+    if progress_cb:
+        progress_cb("调用 AI 中长期策略师（约 30-60 秒）...", 40)
+    messages = [
+        {"role": "system", "content": MIDTERM_SYSTEM_PROMPT},
+        {"role": "user", "content": build_midterm_prompt(funds, market_context)},
+    ]
+    r = llm_chat(messages, temperature=0.4, max_tokens=3500)
+    if not r.get("ok"):
+        return {"ok": False, "msg": r.get("msg", "未知错误")}
+    parsed = parse_llm_json(r.get("content", ""))
+    if not parsed:
+        return {"ok": False, "msg": "AI 输出无法解析为 JSON", "raw": r.get("content")}
+    if progress_cb:
+        progress_cb("保存结果...", 90)
+    target_date = compute_midterm_target_date()
+    # 带分析时净值快照（供复盘对比），并给每只基金补 ref_nav 和 name（前端优先显示基金名）
+    nav_map = {}
+    name_map = {}
+    for f in funds:
+        nav_map[f.get("code")] = f.get("ref_nav") or f.get("latest_gz")
+        name_map[f.get("code")] = f.get("name") or f.get("code")
+    raw_funds = parsed.get("funds") or {}
+    funds_out = {}
+    for code, spec in raw_funds.items():
+        s = dict(spec) if isinstance(spec, dict) else {}
+        s["name"] = name_map.get(code, code)
+        funds_out[code] = s
+    entry = {
+        "analyzed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "target_date": target_date,
+        "horizon_days": MIDTERM_HORIZON_DAYS,
+        "summary": parsed.get("summary", ""),
+        "portfolio_trend": parsed.get("portfolio_trend", ""),
+        "portfolio_position": parsed.get("portfolio_position", ""),
+        "sector_advice": parsed.get("sector_advice") or [],
+        "key_risks": parsed.get("key_risks") or [],
+        "key_catalysts": parsed.get("key_catalysts") or [],
+        "funds": funds_out,
+        "ref_nav": nav_map,
+        "status": "pending",
+        "review": None,
+    }
+    data = load_midterm()
+    # 同目标日去重：同一天重复分析只保留最新
+    data[target_date] = entry
+    save_midterm(data)
+    return {"ok": True, "target_date": target_date, "result": entry}
+
+
+def get_midterm_state(target_date=None):
+    """返回中长期模块状态：最近一次分析 + 全部历史（按目标日倒序）
+
+    target_date 指定时返回该期完整数据（历史详情查看用），history 为空。
+    """
+    data = load_midterm()
+    items = sorted(data.keys(), reverse=True)
+    if target_date:
+        e = data.get(str(target_date).strip())
+        if not e:
+            return {"ok": False, "msg": f"未找到目标日 {target_date} 的记录"}
+        return {"ok": True, "latest": e, "history": []}
+    history = []
+    for fd in items:
+        e = data[fd]
+        history.append({
+            "target_date": fd,
+            "analyzed_at": e.get("analyzed_at", ""),
+            "status": e.get("status", "pending"),
+            "fund_count": len(e.get("funds") or {}),
+            "portfolio_trend": e.get("portfolio_trend", ""),
+            "summary": e.get("summary", ""),
+            "reviewed": (e.get("review") or {}).get("ok") is True,
+        })
+    latest = data.get(items[0]) if items else None
+    return {"ok": True, "latest": latest, "history": history}
+
+
+def review_midterm(target_date):
+    """中长期复盘：对比目标日实际净值 vs 分析时净值
+
+    对每只基金：实际涨幅 = (目标日净值/分析时净值 - 1)；
+    - trend=偏多 且实际涨 >0 → 方向对；偏空且跌<0 → 对；震荡且 |实际|<=2% → 对
+    - target_range 命中：实际净值落在区间内
+    返回 {ok, date, results[], direction_rate, range_hit_rate}
+    """
+    data = load_midterm()
+    if target_date not in data:
+        return {"ok": False, "msg": f"未找到目标日 {target_date} 的中长期分析"}
+    entry = data[target_date]
+    funds = entry.get("funds") or {}
+    ref_nav = entry.get("ref_nav") or {}
+    if not funds:
+        return {"ok": False, "msg": "该次分析无基金数据"}
+    results = []
+    ok_count = 0
+    dir_correct = 0
+    range_hit = 0
+    range_total = 0
+    for code, spec in funds.items():
+        base_nav = ref_nav.get(code)
+        if not base_nav:
+            continue
+        hist = fetch_history(code, days=MIDTERM_HORIZON_DAYS + 10)
+        target_nav = None
+        for x in hist:
+            if x.get("date") == target_date:
+                target_nav = x.get("nav")
+                break
+        if target_nav is None:
+            results.append({"ok": False, "code": code, "msg": "目标日净值未更新（T+N 滞后或未到）"})
+            continue
+        actual_pct = round((target_nav / base_nav - 1) * 100, 2)
+        trend = str(spec.get("trend", "")).strip()
+        actual_dir = "UP" if actual_pct > 0.1 else ("DOWN" if actual_pct < -0.1 else "FLAT")
+        dir_ok = (trend == "偏多" and actual_dir == "UP") or \
+                 (trend == "偏空" and actual_dir == "DOWN") or \
+                 (trend == "震荡" and actual_dir == "FLAT")
+        # 区间命中：target_range "a-b"（可能有备注）是否包含目标日净值
+        range_hit_flag = None
+        try:
+            nums = re.findall(r"\d+\.\d+", str(spec.get("target_range", "")))
+            if len(nums) >= 2:
+                lo, hi = sorted([float(nums[0]), float(nums[1])])
+                if lo != hi:
+                    range_hit_flag = (lo <= target_nav <= hi)
+        except Exception:
+            range_hit_flag = None
+        if range_hit_flag is not None:
+            range_total += 1
+            if range_hit_flag:
+                range_hit += 1
+        ok_count += 1
+        if dir_ok:
+            dir_correct += 1
+        results.append({
+            "ok": True, "code": code,
+            "trend": trend, "target_range": spec.get("target_range", ""),
+            "ref_nav": base_nav, "target_nav": target_nav,
+            "actual_pct": actual_pct, "dir_ok": dir_ok,
+            "range_hit": range_hit_flag,
+        })
+    review = {
+        "ok": True,
+        "reviewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "results": results,
+        "direction_correct": dir_correct,
+        "direction_total": ok_count,
+        "direction_rate": round(dir_correct / ok_count * 100, 1) if ok_count else None,
+        "range_hit": range_hit,
+        "range_total": range_total,
+        "range_rate": round(range_hit / range_total * 100, 1) if range_total else None,
+    }
+    entry["status"] = "reviewed"
+    entry["review"] = review
+    data[target_date] = entry
+    save_midterm(data)
+    return review

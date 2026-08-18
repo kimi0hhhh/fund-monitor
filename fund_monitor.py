@@ -576,8 +576,17 @@ def _fetch_index_estimate(code, base):
     return None
 
 
-def fetch_batch(codes):
-    """腾讯批量行情（名称/净值/日涨跌）+ 多源盘中估值（fundgz/东财/蛋卷）"""
+def fetch_batch(codes, confirm_map=None):
+    """腾讯批量行情（名称/净值/日涨跌）+ 多源盘中估值（fundgz/东财/蛋卷）
+
+    confirm_map: {code: confirm_days}，用于区分 T+N 基金——QDII 等 T+N>1 基金
+    净值滞后是常态（qdate 永远不是今天），收盘后不走估值链，直接用腾讯官方数据。
+    """
+    if confirm_map is None:
+        try:
+            confirm_map = {c: int(d.get("confirm_days", 1)) for c, d in load_data().items()}
+        except Exception:
+            confirm_map = {}
     result = {}
     try:
         q = ",".join(f"jj{c}" for c in codes)
@@ -638,6 +647,33 @@ def fetch_batch(codes):
             # 收盘后/盘前/周末：官方净值已更新(qdate=今天)则保留官方数据，不走估值
             if base.get("qdate") == datetime.now().strftime("%Y-%m-%d"):
                 continue
+            # T+N>1（QDII 等）：净值滞后是常态，qdate 永远不是今天，
+            # 官方最新净值就是「收盘」——直接用腾讯官方数据，不走估值链
+            if confirm_map.get(code, 1) > 1:
+                em = _fetch_em_official(code)
+                if em and em.get("date") > base.get("qdate", ""):
+                    base["gz"] = em["nav"]
+                    base["gz_pct"] = em["pct"]
+                    base["gz_time"] = em["date"]
+                    base["qdate"] = em["date"]
+                    base["nav"] = em["nav"]
+                    base["est"] = False
+                    base.pop("est_pending", None)
+                    base["est_src"] = "eastmoney"
+                continue
+            # 腾讯滞后（qdate≠今天）时，先用东财官方净值兜底：
+            # 东财 lsjz 更新通常早于腾讯行情，复盘"到了"但持仓仍预估就源于此
+            em = _fetch_em_official(code)
+            if em and em.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                base["gz"] = em["nav"]
+                base["gz_pct"] = em["pct"]
+                base["gz_time"] = em["date"]
+                base["qdate"] = em["date"]
+                base["nav"] = em["nav"]
+                base["est"] = False
+                base.pop("est_pending", None)
+                base["est_src"] = "eastmoney"
+                continue
             # 仅交易日收盘后（15:00 后）且官方净值未更新：用估值链算「今日预估」，
             # 标记 est_pending（前端显示「收盘未更新」）；盘前/周末保持官方昨日数据
             if not (is_market_open_today() and _now.hour >= 15):
@@ -689,18 +725,62 @@ def fetch_benchmark_pct():
     return None
 
 
+_em_official_cache = {}
+
+
+def _fetch_em_official(code):
+    """东财最新官方净值（腾讯 qdate 滞后时兜底用）。返回 {date, nav, pct} 或 None；60 秒缓存。
+
+    腾讯行情接口(qt.gtimg.cn)净值日期更新有时滞后（晚于东财 lsjz），收盘后持仓界面
+    会因此一直显示「预估」而复盘（走东财）已"到"。此函数用于腾讯滞后时补拉官方净值。
+    """
+    now = time.time()
+    hit = _em_official_cache.get(code)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    out = None
+    try:
+        h = dict(HEADERS)
+        h["Referer"] = "http://fundf10.eastmoney.com/"
+        r = requests.get(
+            f"http://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=1&mode=0",
+            headers=h, timeout=8, proxies=_get_proxies())
+        d = r.json()
+        items = d.get("Data", {}).get("LSJZList", [])
+        if items:
+            it = items[0]
+            date = it.get("FSRQ", "")
+            try:
+                nav = float(it.get("DWJZ", 0))
+                pct = float(it.get("JZZZL", 0)) if it.get("JZZZL") not in (None, "") else 0.0
+                if date and nav:
+                    out = {"date": date, "nav": nav, "pct": pct}
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
+    _em_official_cache[code] = (now, out)
+    return out
+
+
 _market_open_cache = {}
 
 
 def is_market_open_today():
-    """判断今天是否开市：拉沪深300指数最新行情日期，与今天比较（兼容周末+法定节假日）
+    """判断今天是否开市：周末直接休市；工作日拉沪深300指数最新行情日期判断。
 
-    指数行情 p[30] 形如 YYYYMMDDHHMMSS，就是最近一个交易日（开市日盘中有当天数据）。
-    接口失败时兜底按周末判断。当日缓存（_build_state 高频调用，避免重复拉接口）。
+    指数行情 p[30] 形如 YYYYMMDDHHMMSS，是最近一个交易日。
+    注意：凌晨/盘前（今天未开盘）时 p[30] 是昨天，不能据此判定今天休市——
+    只有「工作日且已过 15:00 仍无今天数据」才说明今天节假日休市。
+    接口失败时兜底按工作日判断。当日缓存（_build_state 高频调用）。
     """
     key = datetime.now().strftime("%Y-%m-%d")
     if key in _market_open_cache:
         return _market_open_cache[key]
+    now = datetime.now()
+    if now.weekday() >= 5:  # 周末休市
+        _market_open_cache[key] = False
+        return False
     try:
         r = requests.get("http://qt.gtimg.cn/q=sh000300", headers=HEADERS, timeout=6,
                          proxies=_get_proxies())
@@ -709,11 +789,18 @@ def is_market_open_today():
         if m:
             p = m.group(1).split("~")
             if len(p) > 30 and p[30]:
-                _market_open_cache[key] = (p[30][:8] == datetime.now().strftime("%Y%m%d"))
-                return _market_open_cache[key]
+                mkt_date = p[30][:8]
+                if mkt_date == now.strftime("%Y%m%d"):
+                    _market_open_cache[key] = True   # 盘中有今天数据
+                    return True
+                if now.hour < 15:
+                    _market_open_cache[key] = True   # 盘前/盘中：今天未开盘/未收盘，按工作日开市
+                    return True
+                _market_open_cache[key] = False      # 已过 15:00 仍无今天数据 → 节假日休市
+                return False
     except Exception:
         pass
-    _market_open_cache[key] = datetime.now().weekday() < 5
+    _market_open_cache[key] = now.weekday() < 5
     return _market_open_cache[key]
 
 
@@ -782,7 +869,7 @@ class Api:
         total, profit, count, realized = 0.0, 0.0, 0, 0.0
         holdings = 0.0  # 持仓市值（不含闲钱），用于计算各基金占比
         pending = []
-        # 今日预测（当天做过分析才有）
+        # 今日分析产出的预测（锚定成交日次日：盘中→明日，盘后→下下个交易日）
         today_preds = {}
         portfolio_pred = None
         if fa is not None:
@@ -829,7 +916,7 @@ class Api:
                     "confirm_date": o.get("confirm_date", o.get("nav_date", "")),
                     "time": o.get("time", ""),
                 })
-            # 今日预测
+            # 今日分析产出的单只预测（对目标日，见 fdTxt 标注）
             pred = today_preds.get(code)
             today_pred = None
             if pred and pred.get("tomorrow_forecast"):
@@ -1128,7 +1215,7 @@ class Api:
             self._refreshed = True
             self.push()
             return
-        infos = fetch_batch(codes)
+        infos = fetch_batch(codes, {c: int(d.get("confirm_days", 1)) for c, d in self.data.items()})
         self._bench_pct = fetch_benchmark_pct()
         with self._state_lock:
             for c, info in infos.items():
@@ -1719,6 +1806,78 @@ class Api:
 
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "task_id": task_id}
+
+    def analyze_midterm_all(self):
+        """异步生成全部持仓的中长期分析（约 1 个月），返回 task_id"""
+        if fa is None:
+            return {"ok": False, "msg": "fund_analysis 模块未加载"}
+        if not fa.is_configured():
+            return {"ok": False, "msg": "请先在「设置」里配置 API key"}
+        codes = list(self.data.keys())
+        if not codes:
+            return {"ok": False, "msg": "暂无持仓，请先在持仓页添加基金"}
+        task_id = uuid.uuid4().hex[:8]
+        self._tasks[task_id] = {"status": "running", "progress": 0,
+                                "msg": "准备生成中长期分析..."}
+        total = len(codes)
+
+        def worker():
+            try:
+                funds = []
+                for i, code in enumerate(codes):
+                    d = self.data[code]
+                    info = self.info.get(code, {})
+                    name = d.get("name") or info.get("name") or code
+                    gz = info.get("gz")
+                    shares = d.get("shares", 0) or 0
+                    value = shares * gz if shares and gz else 0
+                    self._tasks[task_id] = {"status": "running",
+                                            "progress": round(i * 20.0 / total, 1),
+                                            "msg": f"汇总持仓数据 [{i+1}/{total}]..."}
+                    history = fa.fetch_history(code, 90)
+                    metrics = fa.compute_metrics(history)
+                    holdings = fa.fetch_holdings(code)
+                    funds.append({"code": code, "name": name, "value": value,
+                                  "gz_pct": info.get("gz_pct"),
+                                  "ref_nav": gz, "latest_gz": gz,
+                                  "metrics": metrics, "holdings": holdings})
+
+                def progress(msg, pct_v):
+                    self._tasks[task_id] = {"status": "running",
+                                            "progress": round(20 + pct_v * 0.75, 1),
+                                            "msg": msg}
+
+                r = fa.analyze_midterm(funds, progress_cb=progress)
+                self._tasks[task_id] = {"status": "done", "progress": 100,
+                                        "result": r}
+            except Exception as e:
+                self._tasks[task_id] = {"status": "error", "progress": 100,
+                                        "msg": f"异常: {str(e)[:150]}"}
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "task_id": task_id}
+
+    def get_midterm_state(self, target_date=None):
+        if fa is None:
+            return {"ok": False, "msg": "模块未加载"}
+        st = fa.get_midterm_state(target_date)
+        if not st.get("ok"):
+            return st
+        # 补全历史记录里缺失的基金名（旧数据无 name 字段，用持仓名回填）
+        try:
+            if st.get("latest"):
+                for code, spec in (st["latest"].get("funds") or {}).items():
+                    if isinstance(spec, dict) and not spec.get("name"):
+                        spec["name"] = (self.data.get(code, {}).get("name")
+                                        or self.info.get(code, {}).get("name") or code)
+        except Exception:
+            pass
+        return st
+
+    def review_midterm(self, target_date):
+        if fa is None:
+            return {"ok": False, "msg": "模块未加载"}
+        return fa.review_midterm(str(target_date).strip())
 
     def get_task_status(self, task_id):
         return self._tasks.get(task_id, {"status": "unknown"})
@@ -2442,7 +2601,7 @@ tbody tr:last-child td{border-bottom:none}
       <div class="sub" id="estnote">每 30 秒自动刷新</div>
     </div>
     <div class="card main">
-      <div class="k">今日总体预测</div>
+      <div class="k">下一交易日预测</div>
       <div class="v" id="pf-forecast">--</div>
       <div class="sub" id="pf-detail">暂无今日分析</div>
     </div>
@@ -2457,7 +2616,7 @@ tbody tr:last-child td{border-bottom:none}
       <div class="sub">已计入总资产 · 点击设置</div>
     </div>
     <div class="card">
-      <div class="k">预测准确率</div>
+      <div class="k">预测准确率（方向/综合）</div>
       <div class="v" id="acc-avg">--</div>
       <div class="sub" id="acc-detail">暂无复盘数据</div>
     </div>
@@ -2493,7 +2652,7 @@ tbody tr:last-child td{border-bottom:none}
         <th class="sortable" onclick="sortBy('code')">代码<span class="sarr" id="sarr-code"></span></th>
         <th class="sortable" onclick="sortBy('name')">基金名称<span class="sarr" id="sarr-name"></span></th>
         <th class="sortable" onclick="sortBy('pct')">估算涨幅<span class="sarr" id="sarr-pct"></span></th>
-        <th class="sortable" onclick="sortBy('pred')">今日预测<span class="sarr" id="sarr-pred"></span></th>
+        <th class="sortable" onclick="sortBy('pred')">次日预测<span class="sarr" id="sarr-pred"></span></th>
         <th class="sortable" onclick="sortBy('value')">持有金额(元)<span class="sarr" id="sarr-value"></span></th>
         <th class="sortable" onclick="sortBy('ratio')">占比<span class="sarr" id="sarr-ratio"></span></th>
         <th class="sortable" onclick="sortBy('profit')">今日收益(元)<span class="sarr" id="sarr-profit"></span></th>
@@ -2522,6 +2681,7 @@ tbody tr:last-child td{border-bottom:none}
       <button class="ana-tab" id="atab-review" onclick="switchAnaTab('review')">复盘</button>
       <button class="ana-tab" id="atab-signals" onclick="switchAnaTab('signals')">信号</button>
       <button class="ana-tab" id="atab-tradereview" onclick="switchAnaTab('tradereview')">加减仓复盘</button>
+      <button class="ana-tab" id="atab-midterm" onclick="switchAnaTab('midterm')">中长期</button>
       <button class="ana-tab" id="atab-settings" onclick="openSettings()" style="margin-left:auto;">⚙ 设置</button>
     </div>
 
@@ -2581,6 +2741,23 @@ tbody tr:last-child td{border-bottom:none}
       </div>
       <div id="trade-review-list" class="history-list"></div>
     </div>
+
+    <div id="ana-pane-midterm" style="display:none">
+      <div class="ana-bar">
+        <button class="btn btn-add" onclick="doMidtermAnalyze()" style="background:linear-gradient(135deg,var(--brand),var(--purple))">🤖 生成中长期分析（约 1 个月）</button>
+        <button class="btn btn-add" onclick="doMidtermReview()" style="background:linear-gradient(135deg,var(--down),var(--down))">📋 复盘最新一期</button>
+        <span style="font-size:12px;color:var(--sub)">目标日 = 分析日起 20 个交易日</span>
+      </div>
+      <div id="mt-progress" class="sig-progress" style="display:none">
+        <div class="bar-bg"><div id="mt-progress-fill" class="bar-fg" style="width:0%"></div></div>
+        <div id="mt-progress-msg" class="msg">初始化...</div>
+      </div>
+      <div id="midterm-report" class="ana-report"></div>
+      <div style="margin-top:18px;border-top:1px solid var(--line);padding-top:10px">
+        <div style="font-weight:600;margin-bottom:8px">📅 历史记录</div>
+        <div id="midterm-history" class="history-list"></div>
+      </div>
+    </div>
   </div>
 </div><!-- /app -->
 
@@ -2588,9 +2765,8 @@ tbody tr:last-child td{border-bottom:none}
   <div class="modal">
     <h3 id="m_title">买入</h3>
     <p class="note" id="m_desc"></p>
-    <div class="fld" id="fld_amt" style="display:none"><label>① API Key（必填）</label>
-      <input id="m_amt" placeholder="sk-..." onkeydown="if(event.key==='Enter')saveModal()">
-    </div>
+    <div class="fld" id="fld_amt" style="display:none"><label>① API Key（必填）</label></div>
+    <input id="m_amt" placeholder="sk-..." onkeydown="if(event.key==='Enter')saveModal()">
     <input id="m_amt2" placeholder="累计收益（元）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
     <div class="fld" id="fld_proxy" style="display:none"><label>② 代理地址（非必要，网络异常时可填）</label>
       <input id="m_proxy" placeholder="如 10.110.32.68:7897，留空清除" onkeydown="if(event.key==='Enter')saveModal()">
@@ -2694,6 +2870,8 @@ function pctTag(f){
   const d=new Date();
   const t=String(d.getFullYear())+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   if(f.qdate===t) return '<small>收盘</small>';
+  // T+N>1（QDII 等）：官方净值滞后是常态，qdate 永远不是今天，官方最新数据即「昨日收盘」
+  if((f.confirm_days||1)>1) return '<small class="stale">昨日收盘</small>';
   // 今天已收盘但净值尚未公布（收盘后-晚间净值更新前，qdate 还是昨天）→ 不再误标「昨日收盘」
   if(state&&state.market_open&&d.getHours()>=15) return '<small class="stale">收盘待更新</small>';
   return '<small class="stale">昨日收盘</small>';
@@ -2745,7 +2923,7 @@ function render(st){
   const ic=document.getElementById('idle-cash');
   ic.innerHTML=(masked?'****':(st.idle_cash!=null?fmt(st.idle_cash):'--'))+'<small>元</small>';
 
-  // 今日总体预测（组合层面）
+  // 下一交易日预测（组合层面，锚定成交日次日）
   const pf=document.getElementById('pf-forecast');
   if(st.portfolio_pred){
     pf.innerHTML='<span class="badge '+dirCls(st.portfolio_pred.direction)+'" style="font-size:14px;padding:3px 10px">'+esc(st.portfolio_pred.direction||'-')+'</span> '+esc(st.portfolio_pred.expected_pct||'-')+fdTxt(st.portfolio_pred.forecast_date);
@@ -2757,13 +2935,14 @@ function render(st){
     document.getElementById('pf-detail').textContent='暂无今日分析';
   }
 
-  // 预测准确率（始终显示，带日期）
+  // 预测准确率（始终显示，带日期）——方向准确率 / 综合准确率
   const accAvg=document.getElementById('acc-avg');
   if(st.review_summary){
     const rs=st.review_summary;
-    accAvg.textContent=rs.avg_accuracy+'%';
-    accAvg.className='v '+(rs.avg_accuracy>=80?'up':(rs.avg_accuracy>=50?'flat':'down'));
-    document.getElementById('acc-detail').textContent='复盘 对'+String(rs.date).slice(5)+'日 · 方向对 '+rs.direction_correct+'/'+rs.total;
+    const dirRate=(rs.total?Math.round(rs.direction_correct/rs.total*100):0);
+    accAvg.innerHTML='<span style="font-size:24px">'+dirRate+'%</span><span style="font-size:11px;color:var(--sub);margin:0 4px">/</span><span style="font-size:18px;color:var(--sub)">'+rs.avg_accuracy+'%</span>';
+    accAvg.className='v '+(dirRate>=80?'up':(dirRate>=50?'flat':'down'));
+    document.getElementById('acc-detail').textContent='对'+String(rs.date).slice(5)+'日 · 方向 '+rs.direction_correct+'/'+rs.total+' · 综合(方向50+幅度50)';
   }else{
     accAvg.textContent='--';
     accAvg.className='v';
@@ -3125,6 +3304,167 @@ function switchView(v){
   if(v==='analysis'){ refreshAnaSelects(); checkAnaConfig(); refreshHistoryList(); }
 }
 
+async function refreshMidtermState(){
+  const rep=document.getElementById('midterm-report');
+  if(!rep) return;
+  try{
+    const st=await pywebview.api.get_midterm_state();
+    if(!st.ok){ rep.innerHTML='<div class="empty-state">'+esc(st.msg||'加载失败')+'</div>'; return; }
+    if(st.latest){
+      rep.innerHTML=renderMidtermReport(st.latest);
+    }else{
+      rep.innerHTML='<div class="empty-state">暂无中长期分析。点上方「🤖 生成中长期分析」创建第一份（约 1 个月视角，覆盖全部持仓）。</div>';
+    }
+  }catch(e){ rep.innerHTML='<div class="empty-state">加载失败：'+esc(e.message||e)+'</div>'; }
+}
+
+function renderMidtermReport(e){
+  const funds=e.funds||{};
+  const codes=Object.keys(funds);
+  const trendCls=t=>t.indexOf('多')>=0?'up':(t.indexOf('空')>=0?'down':'flat');
+  let html='';
+  html+='<div class="panel" style="border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px">';
+  html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
+  html+='<div style="font-weight:600">📈 组合中长期策略<span style="font-size:11px;color:var(--sub);margin-left:8px">目标日 '+esc(e.target_date||'')+'（约 1 个月）</span></div>';
+  html+='<span style="font-size:11px;color:var(--sub)">'+esc(e.analyzed_at||'')+'</span></div>';
+  html+='<div style="margin-top:10px"><span class="badge '+trendCls(e.portfolio_trend||'')+'">'+esc(e.portfolio_trend||'-')+'</span> '
+      +'<span style="font-size:12px;color:var(--sub);margin-left:6px">仓位建议：'+esc(e.portfolio_position||'-')+'</span></div>';
+  html+='<div style="margin-top:8px;font-size:13px;color:var(--txt)">'+esc(e.summary||'')+'</div>';
+  if((e.sector_advice||[]).length){
+    html+='<div style="margin-top:10px;font-size:12px;color:var(--sub)">🏷 板块配置：</div><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">';
+    html+=(e.sector_advice||[]).map(s=>
+      '<span style="border:1px solid var(--line);border-radius:8px;padding:3px 8px;font-size:12px">'
+      +esc(s.sector||'')+' <b>'+(String(s.action||'').indexOf('加')>=0?'<span style="color:var(--up)">'+esc(s.action||'')+'</span>':(String(s.action||'').indexOf('减')>=0?'<span style="color:var(--down)">'+esc(s.action||'')+'</span>':esc(s.action||'')))+'</b>'
+      +(s.suggest_pct?' <span style="color:var(--sub)">'+esc(s.suggest_pct)+'</span>':'')
+      +'<div style="font-size:11px;color:var(--sub)">'+esc(s.reason||'')+'</div></span>').join('');
+    html+='</div>';
+  }
+  if((e.key_risks||[]).length) html+='<div style="margin-top:8px;font-size:12px;color:var(--down)">⚠ 风险：'+esc((e.key_risks||[]).join('；'))+'</div>';
+  if((e.key_catalysts||[]).length) html+='<div style="margin-top:4px;font-size:12px;color:var(--up)">⚡ 催化：'+esc((e.key_catalysts||[]).join('；'))+'</div>';
+  html+='</div>';
+
+  if(e.review && e.review.ok){
+    const rv=e.review;
+    html+='<div class="panel" style="border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px">';
+    html+='<div style="font-weight:600;margin-bottom:8px">📋 已复盘（'+esc(rv.reviewed_at||'')+'）</div>';
+    html+='<div style="display:flex;gap:18px;flex-wrap:wrap">';
+    html+='<div><span class="badge '+(rv.direction_rate>=50?'up':'down')+'" style="font-size:16px">'+esc(rv.direction_rate==null?'-':rv.direction_rate+'%')+'</span><div style="font-size:11px;color:var(--sub)">方向正确率（'+esc(rv.direction_correct||0)+'/'+esc(rv.direction_total||0)+'）</div></div>';
+    html+='<div><span class="badge '+(rv.range_rate>=50?'up':'down')+'" style="font-size:16px">'+esc(rv.range_rate==null?'-':rv.range_rate+'%')+'</span><div style="font-size:11px;color:var(--sub)">区间命中率（'+esc(rv.range_hit||0)+'/'+esc(rv.range_total||0)+'）</div></div>';
+    html+='</div></div>';
+  }
+
+  html+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px">';
+  for(const code of codes){
+    const f=funds[code]||{};
+    const rv=(e.review&&e.review.results||[]).find(x=>x.code===code);
+    html+='<div style="border:1px solid var(--line);border-radius:14px;padding:12px">';
+    html+='<div style="display:flex;justify-content:space-between;align-items:center;gap:6px"><span style="font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(code)+'">'+esc(f.name||code)+'</span>'
+        +'<span style="font-size:11px;color:var(--sub)">'+esc(code)+'</span>'
+        +'<span class="badge '+trendCls(f.trend||'')+'">'+esc(f.trend||'-')+'</span></div>';
+    html+='<div style="margin-top:6px;font-size:13px"><b>目标区间：</b>'+esc(f.target_range||'-')+'　<b>预期收益：</b>'
+        +'<span class="'+(String(f.expected_ret||'').indexOf('-')>=0?'down':'up')+'">'+esc(f.expected_ret||'-')+'%</span></div>';
+    html+='<div style="font-size:12px;color:var(--sub);margin-top:3px">关键位：'+esc(f.key_levels||'-')+'</div>';
+    html+='<div style="font-size:12px;color:var(--sub);margin-top:3px">仓位：'+esc(f.position_advice||'-')+' · 信心 '+esc(f.confidence||'-')+'</div>';
+    if(f.stop_loss||f.take_profit){
+      html+='<div style="font-size:12px;margin-top:3px">止损 <span style="color:var(--down)">'+esc(f.stop_loss||'-')+'</span> · 止盈 <span style="color:var(--up)">'+esc(f.take_profit||'-')+'</span></div>';
+    }
+    if(f.phase_plan) html+='<div style="font-size:12px;margin-top:6px;padding:6px 8px;background:var(--panel2);border-radius:8px">🗓 '+esc(f.phase_plan)+'</div>';
+    if((f.key_drivers||[]).length) html+='<div style="font-size:12px;color:var(--sub);margin-top:4px">驱动：'+esc((f.key_drivers||[]).join('、'))+'</div>';
+    html+='<div style="font-size:12px;margin-top:6px;color:var(--txt)">'+esc(f.reason||'')+'</div>';
+    if(rv){
+      if(rv.ok){
+        const dirOk=rv.dir_ok?'✅':'❌';
+        const rangeOk=rv.range_hit==null?'（区间未判定）':(rv.range_hit?'🎯 区间命中':'区间未命中');
+        html+='<div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px">'
+            +dirOk+' 方向'+ (rv.dir_ok?'对':'错')+' · 实际 '+esc(rv.actual_pct)+'%（'+esc(rv.ref_nav)+'→'+esc(rv.target_nav)+'）<br>'+rangeOk+'</div>';
+      }else{
+        html+='<div style="margin-top:8px;font-size:12px;color:var(--down)">'+esc(rv.msg||'')+'</div>';
+      }
+    }
+    html+='</div>';
+  }
+  html+='</div>';
+  return html;
+}
+
+async function doMidtermAnalyze(){
+  const prog=document.getElementById('mt-progress');
+  const rep=document.getElementById('midterm-report');
+  prog.style.display='block';
+  document.getElementById('mt-progress-fill').style.width='0%';
+  document.getElementById('mt-progress-msg').textContent='初始化...（约 1-3 分钟）';
+  const r=await pywebview.api.analyze_midterm_all();
+  if(!r.ok){ toast(r.msg,true); prog.style.display='none'; return; }
+  while(true){
+    await new Promise(res=>setTimeout(res,700));
+    const st=await pywebview.api.get_task_status(r.task_id);
+    document.getElementById('mt-progress-fill').style.width=(st.progress||0)+'%';
+    document.getElementById('mt-progress-msg').textContent=st.msg||'处理中...';
+    if(st.status==='done'){
+      prog.style.display='none';
+      if(st.result && st.result.ok){
+        rep.innerHTML=renderMidtermReport(st.result.result);
+        refreshMidtermHistory();
+        toast('中长期分析完成，目标日 '+st.result.target_date);
+      }else{
+        rep.innerHTML='<div class="empty-state">'+esc((st.result&&st.result.msg)||'生成失败')+'</div>';
+        toast('分析失败',true);
+      }
+      return;
+    }else if(st.status==='error'){
+      prog.style.display='none';
+      toast(st.msg||'分析失败',true);
+      return;
+    }
+  }
+}
+
+async function doMidtermReview(){
+  const prog=document.getElementById('mt-progress');
+  prog.style.display='block';
+  document.getElementById('mt-progress-fill').style.width='0%';
+  document.getElementById('mt-progress-msg').textContent='复盘中...';
+  try{
+    const st=await pywebview.api.get_midterm_state();
+    if(!st.ok || !st.latest){ prog.style.display='none'; toast('暂无中长期分析可复盘',true); return; }
+    const rv=await pywebview.api.review_midterm(st.latest.target_date);
+    prog.style.display='none';
+    if(rv && rv.ok){
+      document.getElementById('midterm-report').innerHTML=renderMidtermReport(st.latest);
+      refreshMidtermHistory();
+      toast('复盘完成：方向正确率 '+rv.direction_rate+'%');
+    }else{
+      toast((rv&&rv.msg)||'复盘失败（可能目标日未到或净值未更新）',true);
+    }
+  }catch(e){ prog.style.display='none'; toast('复盘异常：'+esc(e.message||e),true); }
+}
+
+async function refreshMidtermHistory(){
+  const list=document.getElementById('midterm-history');
+  if(!list) return;
+  try{
+    const st=await pywebview.api.get_midterm_state();
+    if(!st.ok){ return; }
+    const hist=st.history||[];
+    if(hist.length===0){ list.innerHTML='<div class="empty-state">暂无历史记录</div>'; return; }
+    list.innerHTML=hist.map(h=>{
+      const badge=h.reviewed?'<span class="badge up" style="font-size:11px">已复盘</span>':'<span class="badge flat" style="font-size:11px">待复盘</span>';
+      return '<div class="h-item" onclick="loadCachedMidterm(\''+h.target_date+'\')">'
+        +'<div>📅 目标日 '+esc(h.target_date)+' · '+esc(h.portfolio_trend||'')+' · '+esc(h.summary||'')+'</div>'
+        +'<div class="meta">'+esc(h.analyzed_at||'')+' '+badge+' · '+esc(h.fund_count||0)+' 只 →</div></div>';
+    }).join('');
+  }catch(e){}
+}
+
+async function loadCachedMidterm(fd){
+  if(!fd) return;
+  try{
+    const st=await pywebview.api.get_midterm_state(fd);
+    if(!st.ok||!st.latest) return;
+    document.getElementById('midterm-report').innerHTML=renderMidtermReport(st.latest);
+  }catch(e){}
+}
+
 function switchAnaTab(t){
   currentAnaTab=t;
   document.getElementById('atab-today').classList.toggle('active', t==='today');
@@ -3132,15 +3472,18 @@ function switchAnaTab(t){
   document.getElementById('atab-review').classList.toggle('active', t==='review');
   document.getElementById('atab-signals').classList.toggle('active', t==='signals');
   document.getElementById('atab-tradereview').classList.toggle('active', t==='tradereview');
+  document.getElementById('atab-midterm').classList.toggle('active', t==='midterm');
   document.getElementById('ana-pane-today').style.display=t==='today'?'block':'none';
   document.getElementById('ana-pane-history').style.display=t==='history'?'block':'none';
   document.getElementById('ana-pane-review').style.display=t==='review'?'block':'none';
   document.getElementById('ana-pane-signals').style.display=t==='signals'?'block':'none';
   document.getElementById('ana-pane-tradereview').style.display=t==='tradereview'?'block':'none';
+  document.getElementById('ana-pane-midterm').style.display=t==='midterm'?'block':'none';
   if(t==='review'){ refreshReviewDates(); }
   if(t==='history'){ refreshHistoryList(); }
   if(t==='signals'){ refreshSignals(); autoAuditSignals(); }
   if(t==='tradereview'){ refreshTradeReviews(); autoReviewTrades(); }
+  if(t==='midterm'){ refreshMidtermState(); }
 }
 
 async function refreshSignals(){
@@ -3466,6 +3809,7 @@ function openSettings(){
     document.getElementById('m_desc').textContent='填入 API Key、API 地址、模型名称；行情/接口异常时可填代理地址。支持任意 OpenAI 兼容 API。';
     const inp = document.getElementById('m_amt');
     document.getElementById('m_amt2').style.display='none';
+    inp.style.display='block';
     document.getElementById('fld_amt').style.display='block';
     document.getElementById('fld_proxy').style.display='block';
     document.getElementById('fld_base_url').style.display='block';
@@ -3515,6 +3859,7 @@ function editIdleCash(){
   document.getElementById('m_desc').textContent='你的闲置资金（可用于加减仓）。分析时会据此给出闲钱使用建议。';
   const inp = document.getElementById('m_amt');
   document.getElementById('m_amt2').style.display='none';
+  inp.style.display='block';
   document.getElementById('fld_amt').style.display='none';
   document.getElementById('fld_proxy').style.display='none';
   document.getElementById('fld_base_url').style.display='none';
@@ -4180,6 +4525,8 @@ function pctTag(f){
   const d=new Date();
   const t=String(d.getFullYear())+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   if(f.qdate===t) return '<small>收盘</small>';
+  // T+N>1（QDII 等）：官方净值滞后是常态，qdate 永远不是今天，官方最新数据即「昨日收盘」
+  if((f.confirm_days||1)>1) return '<small class="stale">昨日收盘</small>';
   // 今天已收盘但净值尚未公布（收盘后-晚间净值更新前，qdate 还是昨天）→ 不再误标「昨日收盘」
   if(state&&state.market_open&&d.getHours()>=15) return '<small class="stale">收盘待更新</small>';
   return '<small class="stale">昨日收盘</small>';

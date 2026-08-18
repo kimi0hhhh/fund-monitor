@@ -16,6 +16,7 @@ trade_review.json
 trade_lessons.json
 prediction_lessons.json
 review_results.json
+midterm.json
 ui_config.json
 proxy_config.json
 *.bak
