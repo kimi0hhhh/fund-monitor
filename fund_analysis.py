@@ -124,8 +124,47 @@ def llm_chat(messages, temperature=0.6, max_tokens=2500):
 # ================== 历史净值数据 ==================
 _history_cache = {}
 
+def _fetch_tencent_nav(code):
+    """腾讯实时接口兜底：qt.gtimg.cn/q=jj{code} 返回最新官方净值（含日期/涨跌）。
+
+    东财历史净值接口在公司网络被封锁（返回反爬 HTML/超时）时，复盘/分析依赖历史净值
+    会拿不到数据。腾讯 gtimg 对本机可用，可提供最近一个交易日的官方净值：
+      v_jj017193="017193~名称~估算~估算涨跌~~单位净值~累计~涨跌幅~日期~..."
+    返回 {date, nav, pct} 或 None。
+    """
+    try:
+        r = requests.get("http://qt.gtimg.cn/q=jj%s" % code,
+                         headers=HEADERS, timeout=8, proxies=_get_proxies())
+        r.encoding = "gbk"
+        m = re.search(r'="([^"]*)"', r.text)
+        if not m:
+            return None
+        p = m.group(1).split("~")
+
+        def _fv(i):
+            try:
+                v = float(p[i])
+                return v if v == v else None  # 过滤 NaN
+            except (TypeError, ValueError, IndexError):
+                return None
+
+        # 字段对齐：腾讯基金行情 p[2]估算净值、p[5]官方单位净值、p[7]涨跌幅、p[8]日期
+        nav = _fv(5)
+        pct = _fv(7)
+        date = str(p[8]).strip() if len(p) > 8 else ""
+        if nav is None or pct is None or not date:
+            return None
+        return {"date": date, "nav": nav, "pct": pct}
+    except Exception:
+        return None
+
+
 def fetch_history(code, days=90):
-    """拉取基金最近 N 天的日净值（按时间正序），自动分页（当日缓存）"""
+    """拉取基金最近 N 天的日净值（按时间正序），自动分页（当日缓存）。
+
+    东财接口失败（公司网络封锁）时用腾讯实时接口兜底，至少返回最近 1 个交易日，
+    保证复盘/分析有数据可用。
+    """
     key = "%s_%s" % (code, datetime.now().strftime("%Y-%m-%d"))
     if key in _history_cache:
         return _history_cache[key][-days:]
@@ -163,6 +202,11 @@ def fetch_history(code, days=90):
             break
     # 接口返回是倒序，翻成正序
     out.reverse()
+    # ---- 东财拿不到历史（公司网络封锁/接口异常）：腾讯实时接口兜底 ----
+    if not out:
+        tn = _fetch_tencent_nav(code)
+        if tn:
+            out.append(tn)
     _history_cache[key] = out[-90:]
     return out[-days:]
 
