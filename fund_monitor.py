@@ -7,6 +7,7 @@ pywebview (WebView2) + 内嵌 HTML/CSS，深色金融风面板
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -57,8 +58,7 @@ def _load_proxy():
 
 
 def _save_proxy(proxy):
-    with open(PROXY_FILE, "w", encoding="utf-8") as f:
-        json.dump({"proxy": (proxy or "").strip()}, f, ensure_ascii=False, indent=2)
+    _atomic_write(PROXY_FILE, {"proxy": (proxy or "").strip()})
 
 
 def _get_proxies():
@@ -87,7 +87,7 @@ def _single_instance_check():
 
 def load_ui_config():
     """读取 UI 偏好：collapsed(悬浮窗是否收起)、mask(默认隐藏金额)、autostart(开机自启)"""
-    default = {"collapsed": False, "mask": True, "autostart": False}
+    default = {"collapsed": True, "mask": True, "autostart": False}
     try:
         with open(UI_CONFIG_FILE, "r", encoding="utf-8") as f:
             return {**default, **json.load(f)}
@@ -96,11 +96,7 @@ def load_ui_config():
 
 
 def save_ui_config(cfg):
-    try:
-        with open(UI_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _atomic_write(UI_CONFIG_FILE, cfg)
 
 
 def _autostart_enabled():
@@ -152,12 +148,36 @@ def load_data():
     return {}
 
 
-def save_data(data):
+def _atomic_write(path, data, indent=2):
+    """原子写 JSON：先写临时文件再 os.replace 替换，避免进程异常退出/并发写
+    导致文件损坏（如全零写入）。写前把旧文件备份为 .bak。"""
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        # 备份旧文件（存在时）
+        if os.path.exists(path):
+            try:
+                shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
+        os.replace(tmp, path)
+        return True
     except Exception as e:
         print("保存失败:", e)
+        # 清理临时文件
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def save_data(data):
+    _atomic_write(DATA_FILE, data)
 
 
 def load_idle_cash():
@@ -175,11 +195,7 @@ def load_idle_cash():
 
 
 def save_idle_cash(amount):
-    try:
-        with open(IDLE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"amount": amount}, f, ensure_ascii=False)
-    except Exception:
-        pass
+    _atomic_write(IDLE_FILE, {"amount": amount})
 
 
 def load_rate_history():
@@ -198,8 +214,7 @@ def save_rate_history(data):
     try:
         dates = sorted(data.keys(), reverse=True)[:30]
         keep = {d: data[d] for d in dates}
-        with open(RATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(keep, f, ensure_ascii=False)
+        _atomic_write(RATE_FILE, keep, indent=None)
     except Exception:
         pass
 
@@ -672,7 +687,7 @@ class Api:
         self._review_summary = None  # 收盘后复盘的汇总缓存
         self._state_lock = threading.RLock()  # 保护 data/info 读写，避免加载中并发渲染错乱
         _ui = load_ui_config()
-        self._float_collapsed = False  # 悬浮窗固定展开（已彻底移除收起功能）
+        self._float_collapsed = bool(_ui.get("collapsed", True))  # 悬浮窗默认收起小条
         self._float_on_top = True  # 悬浮窗是否置顶
         self._mask_amount = bool(_ui.get("mask", True))  # 默认隐藏金额（总资产/闲钱打码）
         self.idle_cash = load_idle_cash()  # 闲钱（可用于加减仓的闲置资金）
@@ -808,6 +823,7 @@ class Api:
             "idle_cash": self.idle_cash,
             "rate_points": self._rate_history.get(datetime.now().strftime("%Y-%m-%d"), []),
             "mask": self._mask_amount,
+            "collapsed": self._float_collapsed,
         }
 
     def add_fund(self, code, amount, confirm_days=1):
@@ -1157,13 +1173,16 @@ class Api:
         return {"ok": True}
 
     def show_floating(self):
-        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（固定展开，不缩成条）"""
+        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（按保存的偏好恢复收起/展开）"""
         if not self._float_window:
             return {"ok": False, "msg": "无悬浮窗"}
         try:
             self._main_window.hide()
             self._float_window.show()
             self._main_visible = False
+            # 若保存的是收起态，确保窗口尺寸/位置为收起状态
+            if self._float_collapsed:
+                self._apply_float_size()
         except Exception as e:
             print("show_floating 异常:", e)
             # 悬浮窗失败时恢复主窗口，避免用户什么都看不到
@@ -1249,6 +1268,7 @@ class Api:
             "ok": True,
             "mask": self._mask_amount,
             "autostart": _autostart_enabled(),
+            "collapsed": self._float_collapsed,
         }
 
     def quit_app(self):
@@ -1282,8 +1302,40 @@ class Api:
             return {"ok": False, "msg": str(e)[:80]}
 
     def toggle_collapse(self):
-        """已移除收起功能：悬浮窗固定展开，此方法保留兼容返回 False 状态"""
-        return {"ok": True, "collapsed": False}
+        """收起/展开悬浮窗：收起时缩成小条贴屏幕右下角，展开恢复"""
+        w = self._float_window
+        if not w:
+            return {"ok": False, "msg": "无悬浮窗"}
+        try:
+            self._float_collapsed = not self._float_collapsed
+            self._apply_float_size()
+            # 偏好持久化
+            cfg = load_ui_config()
+            cfg["collapsed"] = self._float_collapsed
+            save_ui_config(cfg)
+            return {"ok": True, "collapsed": self._float_collapsed}
+        except Exception as e:
+            self._float_collapsed = not self._float_collapsed
+            return {"ok": False, "msg": str(e)[:80]}
+
+    def _apply_float_size(self):
+        """按当前收起/展开状态设置悬浮窗尺寸与位置（工作区内，避开任务栏）"""
+        w = self._float_window
+        if not w:
+            return
+        if self._float_collapsed:
+            cw, ch = 260, 72
+        else:
+            cw, ch = 378, 516
+        w.resize(cw, ch)
+        # 用排除任务栏后的可用区域定位，避免收起窗口压在底部任务栏上
+        wax, way, waw, wah = _work_area()
+        margin = 14
+        x = max(wax, wax + waw - cw - margin)
+        y = max(way, way + wah - ch - margin)
+        w.move(x, y)
+        # resize/move 后重新置顶，避免丢失 z-order 被其他窗口盖住
+        _set_topmost(w, self._float_on_top)
 
     # ---------- 分析模式 API ----------
     def get_analysis_config(self):
@@ -1311,6 +1363,39 @@ class Api:
         """保存代理配置（空串=清除代理）"""
         _save_proxy(proxy or "")
         return {"ok": True, "proxy": _load_proxy()}
+
+    def test_connection(self, api_key, model=None, base_url=None):
+        """测试 LLM API 连接：用当前表单配置发一条最小请求（不保存，仅验证）"""
+        if fa is None:
+            return {"ok": False, "msg": "fund_analysis 模块未加载"}
+        cfg = fa.load_config()
+        if model: cfg["model"] = model
+        if base_url: cfg["base_url"] = base_url
+        if api_key: cfg["api_key"] = api_key
+        if not cfg.get("api_key"):
+            return {"ok": False, "msg": "API Key 为空"}
+        try:
+            import time as _t
+            t0 = _t.time()
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=cfg["api_key"],
+                base_url=cfg.get("base_url") or "https://api.deepseek.com",
+            )
+            model_name = cfg.get("model") or "deepseek-v4-pro"
+            kwargs = dict(model=model_name,
+                          messages=[{"role": "user", "content": "ping"}],
+                          max_tokens=8)
+            if "deepseek" in model_name.lower():
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            r = client.chat.completions.create(**kwargs)
+            elapsed = int((_t.time() - t0) * 1000)
+            content = (r.choices[0].message.content or "").strip()
+            if not content:
+                return {"ok": False, "msg": "连接成功但返回空内容（可能思考模式未关）", "elapsed_ms": elapsed}
+            return {"ok": True, "model": model_name, "elapsed_ms": elapsed, "reply": content[:40]}
+        except Exception as e:
+            return {"ok": False, "msg": "LLM 调用失败: %s" % str(e)[:200]}
 
     def _get_signal_context(self, code):
         """获取某基金的历史信号（供分析参考，最近 5 条）"""
@@ -2155,12 +2240,12 @@ tbody tr:last-child td{border-bottom:none}
       <div class="sub" id="count">--</div>
     </div>
     <div class="card main">
-      <div class="k">今日估算收益</div>
+      <div class="k" id="k-profit">今日估算收益</div>
       <div class="v" id="profit">--</div>
-      <div class="sub">盘中估值仅供参考 · 红涨绿跌</div>
+      <div class="sub" id="profit-sub">盘中估值仅供参考 · 红涨绿跌</div>
     </div>
     <div class="card main">
-      <div class="k">今日估算收益率</div>
+      <div class="k" id="k-rate">今日估算收益率</div>
       <div class="v" id="rate">--</div>
       <div class="sub" id="estnote">每 30 秒自动刷新</div>
     </div>
@@ -2309,13 +2394,22 @@ tbody tr:last-child td{border-bottom:none}
   <div class="modal">
     <h3 id="m_title">买入</h3>
     <p class="note" id="m_desc"></p>
-    <input id="m_amt" placeholder="金额（元）" onkeydown="if(event.key==='Enter')saveModal()">
+    <div class="fld" id="fld_amt" style="display:none"><label>① API Key（必填）</label>
+      <input id="m_amt" placeholder="sk-..." onkeydown="if(event.key==='Enter')saveModal()">
+    </div>
     <input id="m_amt2" placeholder="累计收益（元）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
-    <input id="m_proxy" placeholder="代理地址（可选）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
-    <input id="m_base_url" placeholder="API 地址（如 https://tokenhub.tencentmaas.com/v1）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
-    <input id="m_model" placeholder="模型名称（如 deepseek-v4-pro）" style="display:none" onkeydown="if(event.key==='Enter')saveModal()">
+    <div class="fld" id="fld_proxy" style="display:none"><label>② 代理地址（非必要，网络异常时可填）</label>
+      <input id="m_proxy" placeholder="如 10.110.32.68:7897，留空清除" onkeydown="if(event.key==='Enter')saveModal()">
+    </div>
+    <div class="fld" id="fld_base_url" style="display:none"><label>③ API 地址（OpenAI 兼容）</label>
+      <input id="m_base_url" placeholder="如 https://api.deepseek.com" onkeydown="if(event.key==='Enter')saveModal()">
+    </div>
+    <div class="fld" id="fld_model" style="display:none"><label>④ 模型名称</label>
+      <input id="m_model" placeholder="如 deepseek-v4-pro" onkeydown="if(event.key==='Enter')saveModal()">
+    </div>
     <div class="row">
       <button class="cancel" onclick="closeModal()">取消</button>
+      <button class="ok" id="btnTest" onclick="testConnection()" style="display:none">测试连接</button>
       <button class="ok" onclick="saveModal()">确认</button>
     </div>
   </div>
@@ -2397,6 +2491,22 @@ function render(st){
   const masked=!!st.mask;
   const mb=document.getElementById('maskBtn');
   if(mb) mb.textContent=masked?'👁 显示金额':'🙈 隐藏金额';
+  // 收益卡片标题动态化：盘中=今日估算；全收盘=收盘收益；昨日数据=昨日收盘收益；开盘后恢复今日估算
+  const fl=st.funds||[];
+  const anyEst=fl.some(f=>f.est);
+  const todayStr=String(new Date().getFullYear())+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0');
+  const allClosed=fl.length>0 && !anyEst;
+  const isToday=fl.length>0 && allClosed && fl.some(f=>f.qdate===todayStr);
+  let kp='今日估算收益', ks='盘中估值仅供参考 · 红涨绿跌';
+  if(anyEst){ kp='今日估算收益'; ks='盘中估值仅供参考 · 红涨绿跌'; }
+  else if(fl.length>0 && isToday){ kp='收盘收益'; ks='今日已收盘 · 官方净值'; }
+  else if(fl.length>0){ kp='昨日收盘收益'; ks='今日未开盘 · 最新净值'; }
+  const kpEl=document.getElementById('k-profit');
+  if(kpEl){kpEl.textContent=kp;}
+  const ksEl=document.getElementById('profit-sub');
+  if(ksEl){ksEl.textContent=ks;}
+  const krEl=document.getElementById('k-rate');
+  if(krEl){krEl.textContent=kp==='今日估算收益'?'今日估算收益率':(kp==='收盘收益'?'收盘收益率':'昨日收盘收益率');}
   // 汇总
   document.getElementById('total').innerHTML=(masked?'****':fmt(st.total))+'<small>元</small>';
   const p=document.getElementById('profit');
@@ -2631,6 +2741,11 @@ function openModal(mode){
   document.getElementById('m_proxy').style.display='none';
   document.getElementById('m_model').style.display='none';
   document.getElementById('m_base_url').style.display='none';
+  document.getElementById('fld_amt').style.display='none';
+  document.getElementById('fld_proxy').style.display='none';
+  document.getElementById('fld_base_url').style.display='none';
+  document.getElementById('fld_model').style.display='none';
+  document.getElementById('btnTest').style.display='none';
   inp.style.display='block';
   inp.dataset.mode='';
   if(mode==='delete'){
@@ -2871,6 +2986,11 @@ function clearSignals(){
   document.getElementById('m_amt2').style.display='none';
   document.getElementById('m_model').style.display='none';
   document.getElementById('m_base_url').style.display='none';
+  document.getElementById('fld_amt').style.display='none';
+  document.getElementById('fld_proxy').style.display='none';
+  document.getElementById('fld_base_url').style.display='none';
+  document.getElementById('fld_model').style.display='none';
+  document.getElementById('btnTest').style.display='none';
   modalMode='clear-signals';
   document.getElementById('mask').classList.add('show');
 }
@@ -3097,28 +3217,30 @@ function openSettings(){
   pywebview.api.get_analysis_config().then(r=>{
     const cfg = r.config || {};
     document.getElementById('m_title').textContent='分析设置（LLM API + 代理）';
-    document.getElementById('m_desc').textContent='填入 API 地址、Key、模型名称；行情/接口异常时可填代理地址。支持任意 OpenAI 兼容 API。';
+    document.getElementById('m_desc').textContent='填入 API Key、API 地址、模型名称；行情/接口异常时可填代理地址。支持任意 OpenAI 兼容 API。';
     const inp = document.getElementById('m_amt');
     document.getElementById('m_amt2').style.display='none';
+    document.getElementById('fld_amt').style.display='block';
+    document.getElementById('fld_proxy').style.display='block';
+    document.getElementById('fld_base_url').style.display='block';
+    document.getElementById('fld_model').style.display='block';
+    document.getElementById('btnTest').style.display='block';
     const prx = document.getElementById('m_proxy');
-    prx.style.display='block';
     prx.value='';
     pywebview.api.get_proxy_config().then(r2=>{
       if(r2 && r2.ok && r2.proxy) prx.value = r2.proxy;
     });
-    prx.placeholder = '代理地址（可选，如 10.110.32.68:7897，留空清除）';
+    prx.placeholder = '如 10.110.32.68:7897，留空清除';
     // API 地址
     const urlInput = document.getElementById('m_base_url');
-    urlInput.style.display='block';
     urlInput.value = cfg.base_url || '';
-    urlInput.placeholder = 'API 地址（如 https://tokenhub.tencentmaas.com/v1）';
+    urlInput.placeholder = '如 https://api.deepseek.com';
     // 模型名称
     const modelInput = document.getElementById('m_model');
-    modelInput.style.display='block';
     modelInput.value = cfg.model || 'deepseek-v4-pro';
-    modelInput.placeholder = '模型名称（如 deepseek-v4-pro）';
+    modelInput.placeholder = '如 deepseek-v4-pro';
     inp.value = cfg.api_key || '';
-    inp.placeholder = 'API Key';
+    inp.placeholder = 'sk-...';
     inp.type = 'text';
     inp.dataset.mode='settings';
     document.getElementById('mask').classList.add('show');
@@ -3126,14 +3248,32 @@ function openSettings(){
   });
 }
 
+async function testConnection(){
+  // 用当前表单填写的配置做一次最小 LLM 请求，验证 API 连通性（不保存）
+  const key = (document.getElementById('m_amt').value||'').trim();
+  const model = (document.getElementById('m_model').value||'').trim() || 'deepseek-v4-pro';
+  const base_url = (document.getElementById('m_base_url').value||'').trim() || '';
+  if(!key){toast('请先填写 API Key', true);return;}
+  const btn=document.getElementById('btnTest');
+  btn.textContent='测试中...'; btn.disabled=true;
+  try{
+    const r = await pywebview.api.test_connection(key, model, base_url);
+    if(r && r.ok) toast('✅ 连接成功：' + (r.model||model) + '（耗时 '+(r.elapsed_ms||'-')+'ms）');
+    else toast('❌ ' + ((r&&r.msg)||'连接失败'), true);
+  }catch(e){ toast('❌ 调用异常：'+e, true); }
+  btn.textContent='测试连接'; btn.disabled=false;
+}
+
 function editIdleCash(){
   document.getElementById('m_title').textContent='设置闲钱';
   document.getElementById('m_desc').textContent='你的闲置资金（可用于加减仓）。分析时会据此给出闲钱使用建议。';
   const inp = document.getElementById('m_amt');
   document.getElementById('m_amt2').style.display='none';
-  document.getElementById('m_proxy').style.display='none';
-  document.getElementById('m_model').style.display='none';
-  document.getElementById('m_base_url').style.display='none';
+  document.getElementById('fld_amt').style.display='none';
+  document.getElementById('fld_proxy').style.display='none';
+  document.getElementById('fld_base_url').style.display='none';
+  document.getElementById('fld_model').style.display='none';
+  document.getElementById('btnTest').style.display='none';
   inp.value = (state && state.idle_cash) ? state.idle_cash : '';
   inp.placeholder = '闲钱金额（元）';
   inp.type = 'text';
@@ -3726,6 +3866,20 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
 .bar button{flex:1;cursor:pointer;border:none;border-radius:8px;padding:8px 0;
   font-size:12px;font-weight:600;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand))}
 .bar button.close{background:linear-gradient(135deg,var(--sub),var(--sub))}
+
+/* 收起态（缩小到右下角） */
+.collapsed{display:none;flex:1;align-items:center;gap:10px}
+.collapsed .c-info{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
+.collapsed .c-item{font-size:11px;color:var(--sub);white-space:nowrap}
+.collapsed .c-item b{color:var(--txt);font-size:13px;font-variant-numeric:tabular-nums;margin-left:4px}
+.collapsed .expand{cursor:pointer;border:none;border-radius:8px;width:34px;height:34px;
+  font-size:16px;line-height:1;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand))}
+body.collapsed .titlebar{display:none}
+body.collapsed .sum{display:none}
+body.collapsed .list{display:none}
+body.collapsed .bar{display:none}
+body.collapsed .collapsed{display:flex}
+body.collapsed #mini{padding:10px 12px;gap:0}
 ::-webkit-scrollbar{width:6px}
 ::-webkit-scrollbar-thumb{background:var(--scrollbar);border-radius:3px}
 </style>
@@ -3747,7 +3901,7 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
       <div class="v" id="total">--</div>
     </div>
     <div class="box">
-      <div class="k">今日收益(元)</div>
+      <div class="k" id="f-k-profit">今日收益(元)</div>
       <div class="v" id="profit">--</div>
       <div class="v" id="cum-rate" style="font-size:13px;margin-top:3px;font-weight:600">--</div>
     </div>
@@ -3756,6 +3910,13 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
   <div class="bar">
     <button class="close" onclick="hideToTray()" title="隐藏到系统托盘（右键托盘可彻底退出）">隐藏到托盘</button>
     <button onclick="expand()">展开完整版</button>
+  </div>
+  <div class="collapsed">
+    <div class="c-info">
+      <span class="c-item">总资产<b id="c-total">--</b></span>
+      <span class="c-item">今日收益<b id="c-profit">--</b></span>
+    </div>
+    <button class="expand" onclick="toggleCollapse()" title="展开">⤢</button>
   </div>
 </div>
 
@@ -3792,6 +3953,21 @@ function toggleTheme(){
 
 function render(st){
   state=st;
+  // 收起态与 Python 状态同步（默认收起小条）
+  if(typeof st.collapsed!=='undefined'){
+    document.body.classList.toggle('collapsed', !!st.collapsed);
+  }
+  // 收益卡片标题动态化（与主窗口一致）
+  const fl=st.funds||[];
+  const anyEst=fl.some(f=>f.est);
+  const todayStr=String(new Date().getFullYear())+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0');
+  const fk=document.getElementById('f-k-profit');
+  if(fk){
+    if(anyEst){fk.textContent='今日估算收益(元)';}
+    else if(fl.length>0 && fl.some(f=>f.qdate===todayStr)){fk.textContent='今日收盘收益(元)';}
+    else if(fl.length>0){fk.textContent='昨日收盘收益(元)';}
+    else{fk.textContent='今日收益(元)';}
+  }
   const masked=!!st.mask;
   document.getElementById('total').textContent=masked?'****':fmt(st.total);
   const p=document.getElementById('profit');
@@ -3804,6 +3980,11 @@ function render(st){
   const ce=document.getElementById('cum-rate');
   ce.textContent=cr==null?'--':'累计 '+sgn(cr)+'%';
   ce.className='v '+cls(cr);
+  // 收起态小条同步
+  document.getElementById('c-total').textContent=masked?'****':fmt(st.total);
+  const cp=document.getElementById('c-profit');
+  cp.textContent=(st.profit>0?'+':'')+fmt(st.profit);
+  cp.className='c-profit '+cls(st.profit);
   const list=document.getElementById('list');
   if(!st.funds.length){list.innerHTML='<div class="empty">暂无持仓</div>';return;}
   // 排序：先按涨幅降序，涨幅相同再按持仓占比降序
@@ -3851,8 +4032,10 @@ function applyBootState(on){
 }
 
 async function toggleCollapse(){
-  // 收起功能已移除，悬浮窗固定展开
-  return;
+  const r=await pywebview.api.toggle_collapse();
+  if(r && r.ok){
+    document.body.classList.toggle('collapsed', !!r.collapsed);
+  }
 }
 
 window.addEventListener('pywebviewready',()=>{
