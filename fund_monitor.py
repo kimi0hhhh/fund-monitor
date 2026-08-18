@@ -635,7 +635,28 @@ def fetch_batch(codes):
                 pass
             continue
         if not _in_trading:
-            continue   # 收盘后/盘前/周末：保留腾讯官方数据，不走估值兜底
+            # 收盘后/盘前/周末：官方净值已更新(qdate=今天)则保留官方数据，不走估值
+            if base.get("qdate") == datetime.now().strftime("%Y-%m-%d"):
+                continue
+            # 仅交易日收盘后（15:00 后）且官方净值未更新：用估值链算「今日预估」，
+            # 标记 est_pending（前端显示「收盘未更新」）；盘前/周末保持官方昨日数据
+            if not (is_market_open_today() and _now.hour >= 15):
+                continue
+            try:
+                est = _fetch_estimate(code, base)
+                if est:
+                    base["gz"] = est[0]
+                    if est[1] is not None:
+                        base["gz_pct"] = est[1]
+                    if est[2]:
+                        base["gz_time"] = est[2]
+                        base["qdate"] = _qdate(est[2])
+                    base["est"] = True
+                    base["est_pending"] = True
+                    base["est_src"] = est[3] if len(est) > 3 else ""
+            except Exception:
+                pass
+            continue
         try:
             est = _fetch_estimate(code, base)
             if est:
@@ -668,12 +689,18 @@ def fetch_benchmark_pct():
     return None
 
 
+_market_open_cache = {}
+
+
 def is_market_open_today():
     """判断今天是否开市：拉沪深300指数最新行情日期，与今天比较（兼容周末+法定节假日）
 
     指数行情 p[30] 形如 YYYYMMDDHHMMSS，就是最近一个交易日（开市日盘中有当天数据）。
-    接口失败时兜底按周末判断。
+    接口失败时兜底按周末判断。当日缓存（_build_state 高频调用，避免重复拉接口）。
     """
+    key = datetime.now().strftime("%Y-%m-%d")
+    if key in _market_open_cache:
+        return _market_open_cache[key]
     try:
         r = requests.get("http://qt.gtimg.cn/q=sh000300", headers=HEADERS, timeout=6,
                          proxies=_get_proxies())
@@ -682,10 +709,12 @@ def is_market_open_today():
         if m:
             p = m.group(1).split("~")
             if len(p) > 30 and p[30]:
-                return p[30][:8] == datetime.now().strftime("%Y%m%d")
+                _market_open_cache[key] = (p[30][:8] == datetime.now().strftime("%Y%m%d"))
+                return _market_open_cache[key]
     except Exception:
         pass
-    return datetime.now().weekday() < 5
+    _market_open_cache[key] = datetime.now().weekday() < 5
+    return _market_open_cache[key]
 
 
 class Api:
@@ -848,6 +877,7 @@ class Api:
             "rate_points": self._rate_history.get(datetime.now().strftime("%Y-%m-%d"), []),
             "mask": self._mask_amount,
             "confidence_calibration": self._get_confidence_calibration(),
+            "market_open": is_market_open_today(),
         }
 
     def add_fund(self, code, amount, confirm_days=1):
@@ -2619,10 +2649,16 @@ function sgn(v,d=2){return (v>0?'+':'')+fmt(v,d)}
 function fdTxt(fd){return fd?' <span style="color:var(--sub);font-size:11px">对'+String(fd).slice(5)+'</span>':''}
 function pctTag(f){
   if(!f) return '';
-  if(f.est) return '<small class="stale">预估</small>';
+  if(f.est){
+    if(f.est_pending) return '<small class="stale">收盘未更新</small>';
+    return '<small class="stale">预估</small>';
+  }
   const d=new Date();
   const t=String(d.getFullYear())+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-  return '<small class="stale">'+(f.qdate===t?'收盘':'昨日收盘')+'</small>';
+  if(f.qdate===t) return '<small>收盘</small>';
+  // 今天已收盘但净值尚未公布（收盘后-晚间净值更新前，qdate 还是昨天）→ 不再误标「昨日收盘」
+  if(state&&state.market_open&&d.getHours()>=15) return '<small class="stale">收盘待更新</small>';
+  return '<small class="stale">昨日收盘</small>';
 }
 
 function render(st){
@@ -2630,15 +2666,19 @@ function render(st){
   const masked=!!st.mask;
   const mb=document.getElementById('maskBtn');
   if(mb) mb.textContent=masked?'👁 显示金额':'🙈 隐藏金额';
-  // 收益卡片标题动态化：盘中=今日估算；全收盘=收盘收益；昨日数据=昨日收盘收益；开盘后恢复今日估算
+  // 收益卡片标题动态化：盘中=今日估算；收盘后净值未更新=收盘收益(预估)；收盘后净值已出=官方收盘；未开盘=昨日收盘
   const fl=st.funds||[];
   const anyEst=fl.some(f=>f.est);
+  const pendingEst=fl.some(f=>f.est&&f.est_pending);
   const todayStr=String(new Date().getFullYear())+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0');
   const allClosed=fl.length>0 && !anyEst;
-  const isToday=fl.length>0 && allClosed && fl.some(f=>f.qdate===todayStr);
+  const closedToday=!!(st.market_open && new Date().getHours()>=15);
+  const hasTodayNav=fl.some(f=>f.qdate===todayStr);
   let kp='今日估算收益', ks='盘中估值仅供参考 · 红涨绿跌';
-  if(anyEst){ kp='今日估算收益'; ks='盘中估值仅供参考 · 红涨绿跌'; }
-  else if(fl.length>0 && isToday){ kp='收盘收益'; ks='今日已收盘 · 官方净值'; }
+  if(pendingEst){ kp='收盘收益'; ks='今日已收盘 · 净值未更新（预估）'; }
+  else if(anyEst){ kp='今日估算收益'; ks='盘中估值仅供参考 · 红涨绿跌'; }
+  else if(fl.length>0 && allClosed && hasTodayNav){ kp='收盘收益'; ks='今日已收盘 · 官方净值'; }
+  else if(fl.length>0 && allClosed && closedToday){ kp='收盘收益'; ks='今日已收盘 · 净值待更新'; }
   else if(fl.length>0){ kp='昨日收盘收益'; ks='今日未开盘 · 最新净值'; }
   const kpEl=document.getElementById('k-profit');
   if(kpEl){kpEl.textContent=kp;}
@@ -4095,10 +4135,16 @@ function sgn(v,d=2){return (v>0?'+':'')+fmt(v,d)}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function pctTag(f){
   if(!f) return '';
-  if(f.est) return '<small class="stale">预估</small>';
+  if(f.est){
+    if(f.est_pending) return '<small class="stale">收盘未更新</small>';
+    return '<small class="stale">预估</small>';
+  }
   const d=new Date();
   const t=String(d.getFullYear())+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-  return '<small class="stale">'+(f.qdate===t?'收盘':'昨日收盘')+'</small>';
+  if(f.qdate===t) return '<small>收盘</small>';
+  // 今天已收盘但净值尚未公布（收盘后-晚间净值更新前，qdate 还是昨天）→ 不再误标「昨日收盘」
+  if(state&&state.market_open&&d.getHours()>=15) return '<small class="stale">收盘待更新</small>';
+  return '<small class="stale">昨日收盘</small>';
 }
 
 let darkMode=false;
@@ -4126,8 +4172,10 @@ function render(st){
   const todayStr=String(new Date().getFullYear())+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0');
   const fk=document.getElementById('f-k-profit');
   if(fk){
-    if(anyEst){fk.textContent='今日估算收益(元)';}
-    else if(fl.length>0 && fl.some(f=>f.qdate===todayStr)){fk.textContent='今日收盘收益(元)';}
+    const closedToday=!!(st.market_open && new Date().getHours()>=15);
+    if(fl.some(f=>f.est&&f.est_pending)){fk.textContent='收盘收益(预估)';}
+    else if(anyEst){fk.textContent='今日估算收益(元)';}
+    else if(fl.length>0 && (fl.some(f=>f.qdate===todayStr)||closedToday)){fk.textContent='今日收盘收益(元)';}
     else if(fl.length>0){fk.textContent='昨日收盘收益(元)';}
     else{fk.textContent='今日收益(元)';}
   }
