@@ -455,7 +455,7 @@ FUND_INDEX_MAP = {
 
 # 主动混合基金 → 最新季报前十大重仓股（代码, 权重%）。用实时行情按权重加权估算，
 # 比套用单一行业指数准得多。数据来源：2026-06-30 二季报。
-# 行情代码：A股 sz/sh 前缀；港股 r_hk 前缀；美股 us 前缀。
+# 行情代码：A股 sz/sh 前缀；港股 r_hk 前缀；美股 us 前缀；日股 jp 前缀；韩股 kr 前缀。
 FUND_TOP_STOCKS = {
     # 华夏军工安全C（军工电子/材料）
     "013566": [("sh688385", 9.78), ("sh688281", 9.02), ("sz000962", 8.97), ("sh688375", 8.60),
@@ -477,6 +477,22 @@ FUND_TOP_STOCKS = {
     "018957": [("sz300502", 9.91), ("sz300308", 9.41), ("sz300394", 9.07), ("sh688048", 7.42),
                ("sh600183", 6.77), ("sh600105", 6.46), ("sh688313", 5.57), ("sh601869", 4.87),
                ("sh601138", 4.73), ("sz000725", 3.77)],
+    # 华夏全球科技先锋(QDII)C（美股半导体/存储 + 港股）覆盖率 17.9%
+    "024239": [("usSNDK", 3.11), ("usMU", 2.85), ("usMRVL", 1.60), ("usTSM", 1.57), ("usUMC", 1.51),
+               ("usLITE", 1.51), ("usSTX", 1.49), ("usWDC", 1.46), ("r_hk01888", 1.38), ("r_hk00522", 1.37)],
+    # 国富亚洲机会(QDII)（韩/台/日/港半导体，台积电台股并入美股ADR）覆盖率 35.3%
+    "457001": [("kr000660", 7.95), ("kr005930", 6.47), ("usTSM", 8.93), ("usASML", 3.43),
+               ("jp6981", 3.00), ("r_hk09988", 2.75), ("kr009150", 2.72)],
+    "021662": [("kr000660", 7.95), ("kr005930", 6.47), ("usTSM", 8.93), ("usASML", 3.43),
+               ("jp6981", 3.00), ("r_hk09988", 2.75), ("kr009150", 2.72)],
+    # 天弘全球高端制造(QDII)C（日/港/A/美股半导体设备）覆盖率 21.3%
+    "016665": [("jp285A", 3.88), ("r_hk02476", 3.33), ("sz300308", 2.18), ("usNVDA", 2.16),
+               ("usTSM", 2.09), ("r_hk01347", 2.09), ("usGLW", 2.02), ("sz002384", 1.80),
+               ("sh688498", 1.78)],
+    # 易方达全球成长精选(QDII)C（全球半导体设备/存储/AI）覆盖率 47.5%
+    "012922": [("usLRCX", 6.41), ("jp285A", 5.89), ("usTSM", 5.54), ("usAMD", 4.96),
+               ("sz300502", 4.68), ("sz300308", 4.61), ("usSNDK", 4.46), ("usINTC", 4.26),
+               ("sh688498", 3.34), ("usASML", 3.33)],
 }
 
 
@@ -3973,9 +3989,9 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
 .titlebar .btns button{cursor:pointer;border:none;border-radius:6px;width:24px;height:22px;
   font-size:12px;line-height:1;color:var(--txt);background:rgba(0,0,0,.08);padding:0}
 .titlebar .btns button:hover{background:rgba(0,0,0,.1)}
-.titlebar .btns button.pin.on{background:rgba(var(--brand-rgb),.4);color:#fff}
-.titlebar .btns button.boot.on{background:rgba(var(--orange-rgb),.4);color:#fff}
-.titlebar .btns button.cls:hover{background:rgba(var(--up-rgb),.45)}
+.titlebar .btns button.on{background:rgba(var(--brand-rgb),.4);color:#fff}
+.titlebar .btns button.mask.on{background:rgba(var(--orange-rgb),.4);color:#fff}
+.titlebar .btns button.tray:hover{background:rgba(var(--sub-rgb),.3)}
 
 /* 汇总 */
 .sum{display:grid;grid-template-columns:1.1fr 1fr;gap:10px}
@@ -4013,9 +4029,9 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
     <span class="drag pywebview-drag-region">📈 基金悬浮窗</span>
     <span class="btns">
       <button id="themeBtn" onclick="toggleTheme()" title="切换深色/浅色主题">🌙</button>
-      <button id="pinbtn" class="pin on" onclick="togglePin()" title="取消置顶">📌</button>
-      <button id="bootbtn" onclick="toggleBoot()" title="开机自启">🚀</button>
-      <button class="cls" onclick="expand()" title="关闭（回到主窗口）">✕</button>
+      <button id="maskbtn" onclick="toggleMaskMini()" title="隐藏金额：开">🙈</button>
+      <button id="pinbtn" class="pin on" onclick="togglePin()" title="置顶：开">📌</button>
+      <button class="tray" onclick="hideToTray()" title="隐藏到系统托盘（右键托盘可彻底退出）">⬇</button>
     </span>
   </div>
   <div class="sum">
@@ -4031,7 +4047,6 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
   </div>
   <div class="list" id="list"></div>
   <div class="bar">
-    <button class="close" onclick="hideToTray()" title="隐藏到系统托盘（右键托盘可彻底退出）">隐藏到托盘</button>
     <button onclick="expand()">展开完整版</button>
   </div>
 </div>
@@ -4081,6 +4096,7 @@ function render(st){
     else{fk.textContent='今日收益(元)';}
   }
   const masked=!!st.mask;
+  applyMaskState(masked);
   document.getElementById('total').textContent=masked?'****':fmt(st.total);
   const p=document.getElementById('profit');
   p.textContent=(st.profit>0?'+':'')+fmt(st.profit);
@@ -4113,12 +4129,26 @@ function render(st){
 async function expand(){await pywebview.api.show_main()}
 async function hideToTray(){await pywebview.api.hide_to_tray()}
 
+function applyMaskState(masked){
+  const b=document.getElementById('maskbtn');
+  if(!b) return;
+  b.classList.toggle('on', !!masked);
+  b.textContent=masked?'🙈':'👁';
+  b.title=masked?'隐藏金额：开（点击显示）':'隐藏金额：关（点击隐藏）';
+}
+async function toggleMaskMini(){
+  const r=await pywebview.api.toggle_mask_amount();
+  if(r && r.ok) applyMaskState(!!r.mask);
+}
+
 async function togglePin(){
   const r=await pywebview.api.toggle_pin();
   if(r && r.ok){
     const b=document.getElementById('pinbtn');
-    if(r.on_top){b.classList.add('on');b.textContent='📌';b.title='取消置顶';}
-    else{b.classList.remove('on');b.textContent='📍';b.title='置顶';}
+    if(!b) return;
+    // 固定位置开关：图标不变，用高亮状态表示置顶开/关
+    b.classList.toggle('on', !!r.on_top);
+    b.title=r.on_top?'置顶：开（点击取消）':'置顶：关（点击置顶）';
   }
 }
 
@@ -4148,6 +4178,7 @@ window.addEventListener('pywebviewready',()=>{
   pywebview.api.get_ui_status().then(r=>{
     if(r && r.ok){
       applyBootState(!!r.autostart);
+      applyMaskState(!!r.mask);
     }
   });
   // 今日分析持久化：重启后把今天已保存的分析报告渲染出来
@@ -4199,6 +4230,9 @@ def main():
 
         def toggle_autostart(self):
             return api.toggle_autostart()
+
+        def toggle_mask_amount(self):
+            return api.toggle_mask_amount()
 
         def get_ui_status(self):
             return api.get_ui_status()
