@@ -251,6 +251,185 @@ def fetch_holdings(code):
         return []
 
 
+# ================== 市场快照 + 宏观数据 + 持仓估值 ==================
+_market_cache = {}
+_pe_cache = {}
+
+
+def _gt_split(line):
+    """解析腾讯行情一行 'v_sh000300="a~b~c";' → (sym, fields)"""
+    if '="' not in line:
+        return None, None
+    sym = line.split("=")[0].strip()
+    fields = line.split('="')[1].rstrip('";').split("~")
+    return sym, fields
+
+
+def _gv(fields, i):
+    """安全取浮点字段，取不到返回 None"""
+    try:
+        v = fields[i]
+        return float(v) if v not in ("", None) else None
+    except (ValueError, IndexError):
+        return None
+
+
+def fetch_market_snapshot():
+    """市场快照（腾讯批量接口，当日缓存，全部免费公开、exe 可实时自拉，不依赖任何 MCP）
+
+    覆盖：大盘 Beta（沪深300/上证）+ 风格（创业板指成长 / 中证500中小盘）+ 利率方向（十年国债ETF）。
+    返回 {hs300:{pct,pe,turnover,amount_yi}, sh:{pct}, cyb:{pct}, zz500:{pct}, bond10y:{pct}}，失败返回 None。
+    """
+    key = datetime.now().strftime("%Y-%m-%d")
+    if key in _market_cache:
+        return _market_cache[key]
+    mapping = {"000300": "hs300", "000001": "sh", "399006": "cyb",
+               "000905": "zz500", "511260": "bond10y"}
+    try:
+        r = requests.get("http://qt.gtimg.cn/q=sh000300,sh000001,sz399006,sh000905,sh511260,whUSDCNY",
+                         headers=HEADERS, timeout=6, proxies=_get_proxies())
+        r.encoding = "gbk"
+        out = {}
+        for line in r.text.strip().split(";"):
+            sym, p = _gt_split(line)
+            if not sym or not p:
+                continue
+            code6 = sym.split("_")[1][2:] if len(sym.split("_")) > 1 else ""
+            # 人民币汇率：字段结构特殊（22 字段，p[3]现价 p[13]当日涨跌幅）
+            if code6 == "USDCNY":
+                out["usdcny"] = {"price": _gv(p, 3), "pct": _gv(p, 13)}
+                continue
+            name = mapping.get(code6)
+            if not name or len(p) < 40:
+                continue
+            item = {"pct": _gv(p, 32)}
+            if name == "hs300":
+                item["pe"] = _gv(p, 39)
+                item["turnover"] = _gv(p, 38)
+                item["amount_yi"] = round(_gv(p, 37) / 10000.0, 1) if _gv(p, 37) else None
+            out[name] = item
+        if out:
+            _market_cache[key] = out
+            return out
+    except Exception:
+        pass
+    return None
+
+
+def enrich_holdings_pe(holdings):
+    """给前十大持仓补充估值：批量拉个股 PE/PB，算组合加权 PE（当日缓存）
+
+    holdings: [{code, name, weight, ...}]（fetch_holdings 输出）
+    返回 {weighted_pe, weighted_pb, coverage, items:[{code, name, pe, pb, weight}]}，失败返回 None。
+    用于给 LLM 提供成长/价值风格维度。
+    """
+    if not holdings:
+        return None
+    key = "%s_%s" % (",".join(str(h.get("code", "")) for h in holdings[:10]),
+                     datetime.now().strftime("%Y-%m-%d"))
+    if key in _pe_cache:
+        return _pe_cache[key]
+    try:
+        symbols = []
+        for h in holdings[:10]:
+            c = str(h.get("code", "")).strip()
+            if not c:
+                continue
+            if c.startswith("6"):
+                symbols.append("sh" + c)
+            elif c.startswith(("0", "3")):
+                symbols.append("sz" + c)
+            else:
+                symbols.append(c)
+        if not symbols:
+            return None
+        r = requests.get("http://qt.gtimg.cn/q=" + ",".join(symbols),
+                         headers=HEADERS, timeout=8, proxies=_get_proxies())
+        r.encoding = "gbk"
+        pe_map = {}
+        for line in r.text.strip().split(";"):
+            sym, p = _gt_split(line)
+            if not sym or not p or len(p) < 47:
+                continue
+            code6 = sym.split("_")[1][2:] if len(sym.split("_")) > 1 else ""
+            pe = _gv(p, 39)
+            if pe and pe > 0:
+                pe_map[code6] = {"pe": pe, "pb": _gv(p, 46)}
+        total_w = 0.0
+        wp = 0.0
+        wb = 0.0
+        items = []
+        for h in holdings[:10]:
+            c = str(h.get("code", "")).strip()
+            w = float(h.get("weight", 0) or 0)
+            if c in pe_map:
+                pe = pe_map[c]["pe"]
+                pb = pe_map[c].get("pb")
+                items.append({"code": c, "name": h.get("name", ""),
+                              "pe": pe, "pb": pb, "weight": w})
+                total_w += w
+                wp += w * pe
+                if pb:
+                    wb += w * pb
+        if total_w <= 0:
+            return None
+        result = {
+            "weighted_pe": round(wp / total_w, 2),
+            "weighted_pb": round(wb / total_w, 2) if wb else None,
+            "coverage": round(total_w, 1),
+            "items": items,
+        }
+        _pe_cache[key] = result
+        return result
+    except Exception:
+        return None
+
+
+def build_market_context(market=None):
+    """生成「市场环境 + 风格/利率」文本段（喂 prompt），无数据返回空字符串
+
+    全部基于腾讯实时行情（免费、exe 自拉），替代原月度宏观快照（datapro MCP，exe 调不到）。
+    """
+    if not market:
+        return ""
+    parts = []
+    hs = market.get("hs300") or {}
+    sh = market.get("sh") or {}
+    seg = []
+    if hs.get("pct") is not None:
+        seg.append("沪深300 今日 %+.2f%%" % hs["pct"])
+    if hs.get("pe") is not None:
+        seg.append("PE %.2f" % hs["pe"])
+    if hs.get("turnover") is not None:
+        seg.append("换手率 %.2f%%" % hs["turnover"])
+    if hs.get("amount_yi") is not None:
+        seg.append("成交额 %.0f 亿" % hs["amount_yi"])
+    if sh.get("pct") is not None:
+        seg.append("上证指数 %+.2f%%" % sh["pct"])
+    if seg:
+        parts.append("【市场环境（大盘 Beta 与情绪，供判断整体风险偏好与系统性方向）】")
+        parts.append(" · ".join(seg))
+    style = []
+    cyb = market.get("cyb") or {}
+    if cyb.get("pct") is not None:
+        style.append("创业板指 %+.2f%%（成长）" % cyb["pct"])
+    zz = market.get("zz500") or {}
+    if zz.get("pct") is not None:
+        style.append("中证500 %+.2f%%（中小盘）" % zz["pct"])
+    bond = market.get("bond10y") or {}
+    if bond.get("pct") is not None:
+        style.append("十年国债ETF %+.2f%%（利率方向：涨=利率降、流动性宽松）" % bond["pct"])
+    fx = market.get("usdcny") or {}
+    if fx.get("price") is not None:
+        fx_txt = "人民币 %.4f" % fx["price"]
+        if fx.get("pct") is not None:
+            fx_txt += " %+.2f%%" % fx["pct"]
+        style.append(fx_txt + "（贬=利空外资/利好出口）")
+    if style:
+        parts.append("【风格、利率与汇率】" + " · ".join(style))
+    return "\n".join(parts)
+
+
 # ================== 技术指标 ==================
 def _ma(seq, n):
     if len(seq) < n:
@@ -272,6 +451,167 @@ def _rsi(seq, n=14):
         return 100.0
     rs = gains / losses
     return round(100 - 100 / (1 + rs), 2)
+
+
+def _garch_fit(returns):
+    """纯 Python GARCH(1,1) 拟合（方差目标法 + 网格搜索 α1/β1 最小化负对数似然）
+
+    returns: 日收益率列表（百分比，如 [0.5, -0.3, ...]）
+    GARCH(1,1)：σ_t² = α0 + α1·r_{t-1}² + β1·σ_{t-1}²，方差目标 α0 = ω·(1-α1-β1)
+    返回 (alpha0, alpha1, beta1, sigma2_next)，数据不足或拟合失败返回 None。
+    """
+    import math
+    n = len(returns)
+    if n < 30:
+        return None
+    rs = [r / 100.0 for r in returns]
+    omega = sum(x * x for x in rs) / n
+    if omega <= 0:
+        return None
+    best = None
+    best_nll = float("inf")
+    for a1 in (0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30):
+        for b1 in (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.88, 0.91, 0.94, 0.97):
+            if a1 + b1 >= 0.99:
+                continue
+            a0 = omega * (1 - a1 - b1)
+            sig2 = omega
+            nll = 0.0
+            for r in rs:
+                sig2 = a0 + a1 * r * r + b1 * sig2
+                if sig2 <= 0:
+                    nll = float("inf")
+                    break
+                nll += 0.5 * math.log(sig2) + 0.5 * r * r / sig2
+            if nll < best_nll:
+                best_nll = nll
+                best = (a0, a1, b1)
+    if best is None:
+        return None
+    a0, a1, b1 = best
+    sig2 = omega
+    for r in rs:
+        sig2 = a0 + a1 * r * r + b1 * sig2
+    return a0, a1, b1, sig2
+
+
+def compute_garch_vol(history):
+    """GARCH(1,1) 下一日条件波动率预测（日收益率条件标准差，%），失败返回 None
+
+    相比 compute_metrics 里的历史模拟法 VaR，这是「条件方差」——能反映当前波动聚集状态，
+    用于给 LLM 提供「明天大概波动多大」的量化依据（置信区间的基础）。
+    """
+    import math
+    if not history or len(history) < 30:
+        return None
+    pcts = [h.get("pct") for h in history if h.get("pct") is not None]
+    if len(pcts) < 30:
+        return None
+    fit = _garch_fit(pcts)
+    if not fit:
+        return None
+    _, a1, b1, sig2_next = fit
+    return {
+        "cond_vol_1d": round(math.sqrt(sig2_next) * 100, 2),
+        "alpha1": round(a1, 3),
+        "beta1": round(b1, 3),
+        "persistence": round(a1 + b1, 3),
+    }
+
+
+def _sigmoid(x):
+    import math
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _platt_fit(samples):
+    """Platt scaling 拟合：samples=[(score, correct)]，score∈[0,100]，correct∈{0,1}
+    拟合 p(correct)=sigmoid(a·score/100 + b)，返回 (a, b)；样本<10 不拟合返回 None
+    """
+    if not samples or len(samples) < 10:
+        return None
+    xs = [s / 100.0 for s, _ in samples]
+    ys = [float(c) for _, c in samples]
+    a = b = 0.0
+    lr = 0.5
+    n = len(xs)
+    for _ in range(2000):
+        ga = gb = 0.0
+        for x, y in zip(xs, ys):
+            err = _sigmoid(a * x + b) - y
+            ga += err * x
+            gb += err
+        a -= lr * ga / n
+        b -= lr * gb / n
+    return a, b
+
+
+def apply_posthoc_calibration(report, metrics=None):
+    """后处理校准（机械式，不依赖 LLM 自律）——比 prompt 提示可靠的偏差修正：
+    1. 幅度修正：expected_pct += rolling.bias_pct（方向对时的系统性偏差，无条件机械修正）
+    2. 降级到动量：AI 方向正确率不跑赢动量基线(excess<=0)时，方向覆盖为 12-1 月动量方向
+    3. 信心校准：confidence_score 用 Platt scaling 参数重算为真实正确概率
+    4. 区间预测：加 pred_interval = [修正后 ± conformal_q90]
+    返回校准后的 report（就地修改并返回）。
+    """
+    if not isinstance(report, dict):
+        return report
+    data = load_prediction_lessons()
+    stats = data.get("stats") or {}
+    rolling = data.get("rolling") or {}
+    calib = {}
+    tf = report.get("tomorrow_forecast") or report.get("portfolio_forecast")
+    # 1. 幅度机械修正
+    bias = rolling.get("bias_pct")
+    if bias is None:
+        bias = stats.get("bias_pct")
+    if isinstance(tf, dict) and bias is not None and tf.get("expected_pct"):
+        m = re.search(r"(-?\d+(?:\.\d+)?)", str(tf["expected_pct"]))
+        if m:
+            raw_pct = float(m.group(1))
+            tf["expected_pct"] = round(raw_pct + bias, 2)
+            calib["expected_pct_raw"] = raw_pct
+            calib["bias_applied"] = bias
+    # 2. 降级到动量（单只，AI 不跑赢动量基线时）
+    exc = (stats.get("baselines") or {}).get("excess_vs_best")
+    if isinstance(tf, dict) and exc is not None and exc <= 0 and metrics:
+        mom_dir = metrics.get("momentum_12_1_dir")
+        ai_dir = str(tf.get("direction", "")).upper()
+        if mom_dir in ("UP", "DOWN") and ai_dir in ("UP", "DOWN") and ai_dir != mom_dir:
+            calib["direction_raw"] = ai_dir
+            tf["direction"] = mom_dir
+            calib["momentum_override"] = True
+            if tf.get("reason"):
+                tf["reason"] = "%s（方向已按动量基线修正）" % tf["reason"]
+    # 3. 信心校准（Platt scaling）
+    platt = stats.get("platt")
+    if platt and report.get("confidence_score") is not None:
+        try:
+            a, b = platt.get("a"), platt.get("b")
+            raw_score = float(report["confidence_score"])
+            p = _sigmoid(a * (raw_score / 100.0) + b)
+            calib["confidence_raw"] = raw_score
+            report["confidence_score"] = round(p * 100, 1)
+            calib["confidence_calibrated"] = True
+        except Exception:
+            pass
+    # 4. 区间预测（Conformal 90%）
+    q90 = stats.get("conformal_q90")
+    if isinstance(tf, dict) and q90 is not None and tf.get("expected_pct"):
+        try:
+            m = re.search(r"(-?\d+(?:\.\d+)?)", str(tf["expected_pct"]))
+            if m:
+                center = float(m.group(1))
+                tf["pred_interval"] = [round(center - q90, 2), round(center + q90, 2)]
+        except Exception:
+            pass
+    if calib:
+        report["_calibration"] = calib
+    return report
 
 
 def compute_metrics(history):
@@ -363,6 +703,21 @@ def compute_metrics(history):
                 streak = 1
             break
 
+    # GARCH(1,1) 下一日条件波动率预测（替代/补充历史 VaR，反映当前波动聚集状态）
+    garch = compute_garch_vol(history)
+    cond_vol_1d = garch["cond_vol_1d"] if garch else None
+
+    # 12-1 月动量方向：过去约 60 日累计收益（跳过最近 1 日，避开短期反转）
+    momentum_12_1_dir = None
+    if len(pcts) >= 40:
+        mom_ret = sum(pcts[:-1]) if len(pcts) < 61 else sum(pcts[-61:-1])
+        if mom_ret > 0.3:
+            momentum_12_1_dir = "UP"
+        elif mom_ret < -0.3:
+            momentum_12_1_dir = "DOWN"
+        else:
+            momentum_12_1_dir = "FLAT"
+
     return {
         "last_nav": last,
         "ma5": ma5, "ma10": ma10, "ma20": ma20,
@@ -378,6 +733,8 @@ def compute_metrics(history):
         "var_95": var_95,
         "downside_risk": downside,
         "max_consec_down_days": max_down_days,
+        "cond_vol_1d": cond_vol_1d,
+        "momentum_12_1_dir": momentum_12_1_dir,
     }
 
 
@@ -956,6 +1313,7 @@ SYSTEM_PROMPT = """你是一支专业基金投研团队的「主理人」。团�
 要求：
 1. 只输出 JSON，不要任何 markdown 代码块标记或额外文字。
 2. 严格按以下 schema 输出，不要遗漏字段：
+3. 信号必须「证伪优先」：每个看多信号都要在 risk_scenario 里写清「什么情况下它会错」，不要只写看多逻辑；若找不到任何风险/看空依据，宁可少给信号也不要给无风险兜底的看多信号。
 
 {
   "summary": "用一句话总结今日核心结论（30 字内）",
@@ -1008,14 +1366,15 @@ SYSTEM_PROMPT = """你是一支专业基金投研团队的「主理人」。团�
       "direction": "看多 / 看空",
       "target": "标的（基金代码或板块）",
       "basis": "依据（一句话，后续可验证）",
-      "horizon": "验证期限（如 2周）"
+      "horizon": "验证期限（如 2周）",
+      "risk_scenario": "反向/风险情景（证伪条件：什么情况下该信号会错，一句话）"
     }
   ]
 }
 """
 
 
-def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, latest_pct, holdings=None, signal_context=None, trade_review_context=None, prediction_review_context=None):
+def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, latest_pct, holdings=None, signal_context=None, trade_review_context=None, prediction_review_context=None, market_context=None, holdings_pe=None):
     """把基金数据喂给 LLM"""
     m = metrics or {}
     _now = datetime.now()
@@ -1032,7 +1391,11 @@ def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, la
         f"持有金额: {holding_amount} 元（份额 {shares}）",
         f"最新估值: {latest_gz}",
         f"今日估算涨幅: {latest_pct}%",
-        "",
+    ]
+    # 市场 + 宏观环境（大盘 Beta、情绪、流动性，先给大环境再给基金自身）
+    if market_context:
+        parts += ["", market_context]
+    parts += ["",
         "技术指标（基于近 90 个交易日日净值计算）：",
     ]
     if m:
@@ -1058,6 +1421,17 @@ def build_user_prompt(code, name, holding_amount, shares, metrics, latest_gz, la
         parts += ["", f"前十大持仓股（穿透到底层资产）："]
         for s in holdings[:10]:
             parts.append(f"- {s['code']} {s['name']} · 占比 {s['weight']}% · 行业 {s.get('industry','-')} · {s.get('change_type','')}")
+    # 持仓估值（成长/价值风格维度）
+    if holdings_pe:
+        hp = holdings_pe
+        parts += ["", f"持仓估值穿透：组合加权 PE {hp.get('weighted_pe')}（覆盖前十大 {hp.get('coverage')}% 仓位）"]
+        if hp.get("weighted_pb") is not None:
+            parts.append(f"- 组合加权 PB {hp['weighted_pb']}")
+        for it in hp.get("items", []):
+            line = f"- {it['name']} PE {it['pe']}"
+            if it.get("pb") is not None:
+                line += f" / PB {it['pb']}"
+            parts.append(line)
     # 历史信号（AI 自己的判断记录，供参考修正，并在 confidence_score 中如实反映影响）
     if signal_context:
         parts += ["", "【你的历史信号记录（请参考修正本次判断，并在 confidence_score 中如实反映影响）】"]
@@ -1116,6 +1490,8 @@ def analyze_fund(code, name, holding_amount, shares, latest_gz, latest_pct,
     if progress_cb:
         progress_cb("穿透持仓股...", 33)
     holdings = fetch_holdings(code)
+    market_context = build_market_context(fetch_market_snapshot())
+    holdings_pe = enrich_holdings_pe(holdings) if holdings else None
 
     if progress_cb:
         progress_cb("调用 AI 团队分析（可能 30-60 秒）...", 40)
@@ -1123,7 +1499,8 @@ def analyze_fund(code, name, holding_amount, shares, latest_gz, latest_pct,
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(
             code, name, holding_amount, shares, metrics, latest_gz, latest_pct,
-            holdings, signal_context, trade_review_context, prediction_review_context)},
+            holdings, signal_context, trade_review_context, prediction_review_context,
+            market_context, holdings_pe)},
     ]
     r = llm_chat(messages, temperature=0.5, max_tokens=3500)
     if progress_cb:
@@ -1135,6 +1512,9 @@ def analyze_fund(code, name, holding_amount, shares, latest_gz, latest_pct,
     if not parsed:
         return {"ok": False, "code": code, "name": name,
                 "msg": "AI 输出无法解析为 JSON", "raw": r.get("content")}
+
+    # 后处理校准：机械偏差修正 + 降级动量 + 信心校准 + 区间预测
+    parsed = apply_posthoc_calibration(parsed, metrics)
 
     if progress_cb:
         progress_cb("完成", 100)
@@ -1199,7 +1579,7 @@ PORTFOLIO_SYSTEM_PROMPT = """你是一名专业的基金组合策略师。你面
 """
 
 
-def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_review_context=None, prediction_review_context=None):
+def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_review_context=None, prediction_review_context=None, market_context=None):
     """把持仓组合数据喂给 LLM
 
     signal_contexts: {code: [历史信号...]}，组合层面的 AI 历史判断记录，
@@ -1216,7 +1596,10 @@ def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_rev
     else:
         _date_note = f"今天是 {_today}（已收盘），请预测下一个交易日 {_fd} 的整体涨跌方向与预期涨幅（portfolio_forecast.expected_pct 为 {_fd} 当日涨跌幅）"
     parts = ["以下是用户当前的全部持仓（共 %d 只基金，总市值 %.2f 元）：" % (len(funds), total),
-             _date_note, ""]
+             _date_note]
+    if market_context:
+        parts += ["", market_context]
+    parts += [""]
     for f in funds:
         m = f.get("metrics") or {}
         value = f.get("value", 0) or 0
@@ -1280,9 +1663,10 @@ def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=No
 
     if progress_cb:
         progress_cb("调用 AI 组合策略师分析...", 40)
+    market_context = build_market_context(fetch_market_snapshot())
     messages = [
         {"role": "system", "content": PORTFOLIO_SYSTEM_PROMPT},
-        {"role": "user", "content": build_portfolio_prompt(funds, idle_cash, signal_contexts, trade_review_context, prediction_review_context)},
+        {"role": "user", "content": build_portfolio_prompt(funds, idle_cash, signal_contexts, trade_review_context, prediction_review_context, market_context)},
     ]
     r = llm_chat(messages, temperature=0.5, max_tokens=4000)
     if progress_cb:
@@ -1293,6 +1677,9 @@ def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=No
     parsed = parse_llm_json(r.get("content", ""))
     if not parsed:
         return {"ok": False, "msg": "AI 输出无法解析为 JSON", "raw": r.get("content")}
+
+    # 后处理校准（组合层：机械偏差修正 + 信心校准 + 区间，不做动量降级）
+    parsed = apply_posthoc_calibration(parsed)
 
     if progress_cb:
         progress_cb("完成", 100)
@@ -1506,8 +1893,10 @@ def review_all_predictions(fd):
             continue
         base_ok.append(r)
         actual_dir = r.get("actual_dir")
-        # 1) 动量跟涨：今天涨 → 预测明天涨（幅度=今天涨跌幅）
-        mom_dir = _dir_of(base_pct)
+        # 1) 动量跟涨（12-1 月）：过去约 60 日累计收益（跳过最近 1 日）正=UP 负=DOWN
+        hist_before = [x for x in h if x.get("date") <= dstr]
+        mom_ret = sum(x.get("pct", 0) for x in hist_before[-61:-1]) if len(hist_before) > 1 else base_pct
+        mom_dir = "UP" if mom_ret > 0.3 else ("DOWN" if mom_ret < -0.3 else "FLAT")
         if mom_dir == actual_dir:
             mom_correct += 1
         # 2) 均值回归：方向与今天相反
@@ -1562,6 +1951,23 @@ def review_all_predictions(fd):
             "direction_correct_rate": round(c["dc"] / c["n"] * 100, 1),
             "avg_accuracy": round(c["acc"] / c["n"], 1)})
     confidence_calibration.sort(key=lambda x: -x["sample"])
+    # Platt scaling 样本（confidence_score + 方向对错）+ Conformal 90% 分位数（区间宽度）
+    platt_samples = []
+    abs_devs = []
+    for r in ok_results:
+        pred = agg.get(r.get("code"), {}).get("pred") or {}
+        cs = pred.get("confidence_score")
+        if cs is not None:
+            try:
+                platt_samples.append((float(cs), 1 if r.get("direction_correct") else 0))
+            except (ValueError, TypeError):
+                pass
+        if r.get("abs_deviation") is not None:
+            abs_devs.append(r["abs_deviation"])
+    conformal_q90 = None
+    if len(abs_devs) >= 5:
+        s = sorted(abs_devs)
+        conformal_q90 = round(s[min(int(len(s) * 0.9), len(s) - 1)], 2)
     return {
         "ok": True,
         "date": fd,
@@ -1571,6 +1977,8 @@ def review_all_predictions(fd):
         "total": len(ok_results),
         "baselines": baselines,
         "confidence_calibration": confidence_calibration,
+        "platt_samples": platt_samples,
+        "conformal_q90": conformal_q90,
     }
 
 
@@ -1684,6 +2092,12 @@ def summarize_prediction_lessons(date_str, review_result):
         parsed = parse_llm_json(r.get("content", ""))
         if parsed and isinstance(parsed.get("lessons"), list):
             lessons = [str(x).strip() for x in parsed["lessons"] if str(x).strip()]
+    # Platt scaling 拟合（confidence_score → 真实正确概率）+ Conformal 90% 分位数（区间宽度）
+    platt = None
+    fit = _platt_fit(review_result.get("platt_samples"))
+    if fit:
+        platt = {"a": round(fit[0], 4), "b": round(fit[1], 4)}
+    conformal_q90 = review_result.get("conformal_q90")
     data = {"lessons": lessons, "updated": date_str,
             "stats": {"reviewed": total,
                       "direction_correct_rate": round(dir_correct / total * 100, 1),
@@ -1691,7 +2105,9 @@ def summarize_prediction_lessons(date_str, review_result):
                       "bias_pct": bias_pct,          # 修正值：+ 表示系统性低估
                       "avg_abs_dev": avg_abs_dev,    # 平均绝对偏差（精度）
                       "over_estimate": over, "under_estimate": under,
-                      "baselines": review_result.get("baselines") or {}}}
+                      "baselines": review_result.get("baselines") or {},
+                      "platt": platt,                 # Platt scaling 拟合参数
+                      "conformal_q90": conformal_q90}}  # 90% 区间半宽（%）
     # 滚动历史：按「对哪天的分析」归组（forecast_date）——同一天（同一目标日）重复复盘
     # 替换最后一条，避免重复累积；保留最近 N 次
     fd_main = date_str

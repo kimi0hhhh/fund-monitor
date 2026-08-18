@@ -740,6 +740,13 @@ class Api:
         with self._state_lock:
             return self._build_state()
 
+    def _get_confidence_calibration(self):
+        """信心校准表（各档位历史实际正确率），供前端展示层降级标注（不改写字段）"""
+        try:
+            return fa.load_prediction_lessons().get("confidence_calibration") or []
+        except Exception:
+            return []
+
     def _build_state(self):
         """构造推送给前端的完整状态（调用方需持有 _state_lock）"""
         funds = []
@@ -840,6 +847,7 @@ class Api:
             "idle_cash": self.idle_cash,
             "rate_points": self._rate_history.get(datetime.now().strftime("%Y-%m-%d"), []),
             "mask": self._mask_amount,
+            "confidence_calibration": self._get_confidence_calibration(),
         }
 
     def add_fund(self, code, amount, confirm_days=1):
@@ -2541,6 +2549,19 @@ let sorts=[]; // 多级排序：[{key, dir}]，dir=-1 降序(大在前)、1 升�
 function cls(v){return v>0?'up':(v<0?'down':'flat')}
 function dirCls(v){return v==='UP'?'up':(v==='DOWN'?'down':'flat')}
 
+// 信心展示层降级：AI 自评某档位，但历史该档位实际正确率低时标注「不可靠」
+// （只加标注，不改写 confidence 字段，避免污染复盘统计口径）
+function confTag(level){
+  const cc=(state&&state.confidence_calibration)||[];
+  if(!cc.length) return '';
+  const m=cc.find(function(x){return x.level===level});
+  if(!m) return '';
+  const r=m.direction_correct_rate;
+  if(r===undefined||r===null) return '';
+  if(r<50) return ' <span style="color:var(--warn);font-size:11px" title="历史该档位实际方向正确率 '+r+'%">⚠不可靠</span>';
+  return '';
+}
+
 // 归一化 AI 返回的 verdict（可能是中文），映射到标准 HOLD/BUY/SELL
 function normVerdict(v){
   v=String(v||'').trim();
@@ -2651,7 +2672,7 @@ function render(st){
   if(st.portfolio_pred){
     pf.innerHTML='<span class="badge '+dirCls(st.portfolio_pred.direction)+'" style="font-size:14px;padding:3px 10px">'+esc(st.portfolio_pred.direction||'-')+'</span> '+esc(st.portfolio_pred.expected_pct||'-')+fdTxt(st.portfolio_pred.forecast_date);
     pf.className='v '+dirCls(st.portfolio_pred.direction);
-    document.getElementById('pf-detail').textContent='信心 '+esc(st.portfolio_pred.confidence||'-');
+    document.getElementById('pf-detail').innerHTML='信心 '+esc(st.portfolio_pred.confidence||'-')+confTag(st.portfolio_pred.confidence);
   }else{
     pf.textContent='--';
     pf.className='v';
@@ -3562,7 +3583,7 @@ function renderFullReport(result, container){
     <div class="sec"><div class="k">板块分布</div><div class="v" style="font-weight:400">${esc(st.sector_distribution||'-')}</div></div>
     <div class="sec"><div class="k">集中度 / 分散化</div><div class="v" style="font-weight:400">${esc(st.concentration||'-')} · ${esc(st.diversification||'-')}</div></div>
     <div class="sec"><div class="k">整体风险评级</div><div class="v">${esc(st.risk_level||'-')}</div></div>
-    <div class="sec"><div class="k">整体明日预测</div><div class="v"><span class="badge ${dirCls(pf.direction)}">${esc(pf.direction||'-')}</span> ${esc(pf.expected_pct||'-')}（信心 ${esc(pf.confidence||'-')}）${fdTxt(pf.forecast_date||result.portfolio.report.forecast_date)}</div></div>
+    <div class="sec"><div class="k">整体明日预测</div><div class="v"><span class="badge ${dirCls(pf.direction)}">${esc(pf.direction||'-')}</span> ${esc(pf.expected_pct||'-')}（信心 ${esc(pf.confidence||'-')}${confTag(pf.confidence)}）${fdTxt(pf.forecast_date||result.portfolio.report.forecast_date)}</div></div>
     <div class="sec"><div class="k">预测理由</div><div class="v" style="font-weight:400">${esc(pf.reason||'-')}</div></div>
     <div class="sec"><div class="k">板块调整建议</div><div class="role-grid">${adjRows||'<span class="ts">无</span>'}</div></div>
     <div class="sec"><div class="k">整体调仓建议</div><ul>${(r.rebalance_suggestions||[]).map(x=>'<li>'+esc(x)+'</li>').join('')||'<li>-</li>'}</ul></div>
@@ -3685,7 +3706,7 @@ function renderReport(result, container, sigInfo){
     <div class="row">
       <div class="item"><div class="k">方向</div><div class="v"><span class="badge ${cls(tom.direction)}">${esc(tom.direction||'-')}</span></div></div>
       <div class="item"><div class="k">预期涨跌</div><div class="v">${esc(tom.expected_pct||'-')}</div></div>
-      <div class="item"><div class="k">信心</div><div class="v">${esc(tom.confidence||'-')}</div></div>
+      <div class="item"><div class="k">信心</div><div class="v">${esc(tom.confidence||'-')}${confTag(tom.confidence)}</div></div>
     </div>
     <div class="sec"><div class="k">预测理由</div><div class="v" style="font-weight:400">${esc(tom.reason||'-')}</div></div>
 
@@ -3694,7 +3715,7 @@ function renderReport(result, container, sigInfo){
       <div class="item"><div class="k">趋势</div><div class="v">${esc(mid.trend||'-')}</div></div>
       <div class="item"><div class="k">波动区间</div><div class="v">${esc(mid.target_range||'-')}</div></div>
       <div class="item"><div class="k">仓位建议</div><div class="v">${esc(mid.position_advice||'-')}</div></div>
-      <div class="item"><div class="k">信心</div><div class="v">${esc(mid.confidence||'-')}</div></div>
+      <div class="item"><div class="k">信心</div><div class="v">${esc(mid.confidence||'-')}${confTag(mid.confidence)}</div></div>
     </div>
     <div class="sec"><div class="k">中期关键位</div><div class="v" style="font-weight:400">${esc(mid.key_levels||'-')}</div></div>
     <div class="sec"><div class="k">策略依据</div><div class="v" style="font-weight:400">${esc(mid.reason||'-')}</div></div>
@@ -3744,7 +3765,7 @@ function renderHistoryDetail(rec){
     const pf = (rec.portfolio.portfolio_forecast) || {};
     html += '<div class="sec" style="border:1px solid var(--brand);border-radius:10px;padding:12px 14px;margin-bottom:10px">' +
       '<div style="color:var(--brand);font-weight:600;margin-bottom:6px">📊 组合预测'+fdTxt(rec.portfolio.forecast_date)+'</div>' +
-      '<div class="v"><span class="badge '+dirCls(pf.direction)+'">'+esc(pf.direction||'-')+'</span> '+esc(pf.expected_pct||'-')+'（信心 '+esc(pf.confidence||'-')+'）</div>' +
+      '<div class="v"><span class="badge '+dirCls(pf.direction)+'">'+esc(pf.direction||'-')+'</span> '+esc(pf.expected_pct||'-')+'（信心 '+esc(pf.confidence||'-')+confTag(pf.confidence)+'）</div>' +
       (pf.reason ? '<div class="v" style="font-weight:400;color:var(--sub);margin-top:4px">'+esc(pf.reason)+'</div>' : '') +
       '</div>';
   }
