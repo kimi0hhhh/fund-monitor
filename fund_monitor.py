@@ -1364,6 +1364,103 @@ class Api:
         _save_proxy(proxy or "")
         return {"ok": True, "proxy": _load_proxy()}
 
+    # ---------- 数据导入/导出 ----------
+    def _backup_files_map(self):
+        """基础数据 json 清单：zip 内文件名 → 磁盘路径"""
+        files = {
+            "funds_data.json": DATA_FILE,
+            "idle_cash.json": IDLE_FILE,
+            "rate_history.json": RATE_FILE,
+            "ui_config.json": UI_CONFIG_FILE,
+            "proxy_config.json": PROXY_FILE,
+        }
+        if fa is not None:
+            files.update({
+                "analysis_config.json": fa.CONFIG_FILE,
+                "analysis_history.json": fa.HISTORY_FILE,
+                "signals.json": fa.SIGNALS_FILE,
+                "trade_review.json": fa.TRADE_REVIEW_FILE,
+                "trade_lessons.json": fa.TRADE_LESSONS_FILE,
+                "prediction_lessons.json": fa.PREDICTION_LESSONS_FILE,
+            })
+        return files
+
+    def export_data(self):
+        """把用户基础数据 json 压缩成一个 zip 文件（弹保存对话框）"""
+        try:
+            import zipfile
+            w = self._main_window
+            if w is None:
+                return {"ok": False, "msg": "主窗口未就绪"}
+            default_name = "基金监控数据备份_%s.zip" % datetime.now().strftime("%Y%m%d_%H%M%S")
+            result = w.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename=default_name,
+                file_types=("ZIP 压缩包 (*.zip)",),
+            )
+            if not result:
+                return {"ok": False, "msg": "已取消"}
+            zip_path = result if isinstance(result, str) else str(result)
+            if not zip_path.lower().endswith(".zip"):
+                zip_path += ".zip"
+            files = self._backup_files_map()
+            added = []
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, path in files.items():
+                    if os.path.exists(path):
+                        zf.write(path, name)
+                        added.append(name)
+            return {"ok": True, "msg": "已导出 %d 个数据文件 → %s" % (len(added), os.path.basename(zip_path)), "path": zip_path}
+        except Exception as e:
+            return {"ok": False, "msg": "导出失败: %s" % str(e)[:150]}
+
+    def import_data(self):
+        """从 zip 还原基础数据 json（弹打开对话框），还原后重载内存数据"""
+        try:
+            import zipfile
+            w = self._main_window
+            if w is None:
+                return {"ok": False, "msg": "主窗口未就绪"}
+            result = w.create_file_dialog(
+                webview.OPEN_DIALOG,
+                file_types=("ZIP 压缩包 (*.zip)",),
+                allow_multiple=False,
+            )
+            if not result:
+                return {"ok": False, "msg": "已取消"}
+            zip_path = result[0] if isinstance(result, (list, tuple)) else str(result)
+            files = self._backup_files_map()
+            restored = []
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for name in zf.namelist():
+                    base = os.path.basename(name)
+                    if base in files:
+                        # 写入前备份旧文件
+                        try:
+                            if os.path.exists(files[base]):
+                                shutil.copy2(files[base], files[base] + ".bak")
+                        except Exception:
+                            pass
+                        with zf.open(name) as src, open(files[base], "wb") as dst:
+                            dst.write(src.read())
+                        restored.append(base)
+            # 重新加载内存数据 + 清缓存
+            with self._state_lock:
+                self.data = load_data()
+                self.idle_cash = load_idle_cash()
+                self._rate_history = load_rate_history()
+            if fa is not None:
+                try:
+                    fa._history_cache.clear()
+                    fa._holdings_cache.clear()
+                except Exception:
+                    pass
+            self.refresh()
+            self.push()
+            return {"ok": True, "msg": "已还原 %d 个数据文件，持仓/行情已刷新" % len(restored), "files": restored}
+        except Exception as e:
+            return {"ok": False, "msg": "导入失败: %s" % str(e)[:150]}
+
     def test_connection(self, api_key, model=None, base_url=None):
         """测试 LLM API 连接：用当前表单配置发一条最小请求（不保存，仅验证）"""
         if fa is None:
@@ -2034,6 +2131,8 @@ body.cards-collapsed .card:not(.main){display:none}
 .addbar .btn.btn-del:hover{background:rgba(var(--up-rgb),.26);border-color:rgba(var(--up-rgb),.85)}
 .btn-rule{background:linear-gradient(135deg,var(--purple),var(--brand))}
 .btn-edit{background:linear-gradient(135deg,var(--orange),var(--orange))}
+.btn-export{background:linear-gradient(135deg,#0a84ff,#5e5ce6)}
+.btn-import{background:linear-gradient(135deg,#32d74b,#0a84ff)}
 .addbar .divider{width:1px;height:24px;background:var(--line);align-self:center}
 .addbar .tip{color:var(--sub);font-size:12px;margin-left:auto}
 
@@ -2290,6 +2389,8 @@ tbody tr:last-child td{border-bottom:none}
     <button class="btn btn-edit" onclick="doEdit()">✎ 编辑</button>
     <button class="btn btn-del" onclick="doDel()">删除</button>
     <span class="divider"></span>
+    <button class="btn btn-export" onclick="doExport()" title="把基础数据 json 压缩成 zip 备份">⬇ 导出数据</button>
+    <button class="btn btn-import" onclick="doImport()" title="从 zip 还原基础数据 json">⬆ 导入数据</button>
     <span class="tip">单击选中行 · 点表头排序 · ✎编辑改金额 · 删除需二次确认</span>
   </div>
 
@@ -2729,6 +2830,28 @@ async function showFloating(){
 function doBuy(){openModal('buy')}
 function doSell(){openModal('sell')}
 
+async function doExport(){
+  const r=await pywebview.api.export_data();
+  toast(r.ok?('✅ '+r.msg):('❌ '+(r.msg||'导出失败')), !r.ok);
+}
+
+function doImport(){
+  // 导入会覆盖数据，用自定义 modal 二次确认（WebView2 下 confirm 不可用）
+  document.getElementById('m_title').textContent='导入数据';
+  document.getElementById('m_desc').textContent='从 zip 还原基础数据 json（持仓/闲钱/信号/复盘/历史），将覆盖当前数据。确认导入？';
+  const inp=document.getElementById('m_amt');
+  document.getElementById('m_amt2').style.display='none';
+  document.getElementById('fld_amt').style.display='none';
+  document.getElementById('fld_proxy').style.display='none';
+  document.getElementById('fld_base_url').style.display='none';
+  document.getElementById('fld_model').style.display='none';
+  document.getElementById('btnTest').style.display='none';
+  inp.style.display='none';
+  inp.dataset.mode='';
+  modalMode='import';
+  document.getElementById('mask').classList.add('show');
+}
+
 function openModal(mode){
   modalMode=mode; modalCode=selCode || codeValue();
   if(!/^\d{6}$/.test(modalCode)){
@@ -2802,6 +2925,12 @@ async function saveModal(){
     closeModal();
     toast(r.ok?'已清空全部信号':'清空失败', r.ok?false:true);
     if(r.ok) refreshSignals();
+    return;
+  }
+  if(modalMode==='import'){
+    closeModal();
+    const r=await pywebview.api.import_data();
+    toast(r.ok?('✅ '+r.msg):('❌ '+(r.msg||'导入失败')), !r.ok);
     return;
   }
   // 原有买入/卖出/改规则/编辑
