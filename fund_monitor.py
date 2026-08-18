@@ -86,8 +86,8 @@ def _single_instance_check():
 
 
 def load_ui_config():
-    """读取 UI 偏好：collapsed(悬浮窗是否收起)、mask(默认隐藏金额)、autostart(开机自启)"""
-    default = {"collapsed": False, "mask": True, "autostart": False}
+    """读取 UI 偏好：collapsed(历史字段，已废弃)、mask(默认隐藏金额)、autostart(开机自启)、fixed(悬浮窗固定位置)"""
+    default = {"collapsed": False, "mask": True, "autostart": False, "fixed": True}
     try:
         with open(UI_CONFIG_FILE, "r", encoding="utf-8") as f:
             return {**default, **json.load(f)}
@@ -705,6 +705,7 @@ class Api:
         _ui = load_ui_config()
         self._float_collapsed = False  # 悬浮窗固定展开（已彻底移除收起功能）
         self._float_on_top = True  # 悬浮窗是否置顶
+        self._float_fixed = bool(_ui.get("fixed", True))  # 悬浮窗固定位置（禁止拖动）
         self._mask_amount = bool(_ui.get("mask", True))  # 默认隐藏金额（总资产/闲钱打码）
         self.idle_cash = load_idle_cash()  # 闲钱（可用于加减仓的闲置资金）
         self._rate_history = load_rate_history()  # 盘中收益率采样
@@ -1284,6 +1285,7 @@ class Api:
             "ok": True,
             "mask": self._mask_amount,
             "autostart": _autostart_enabled(),
+            "fixed": self._float_fixed,
         }
 
     def quit_app(self):
@@ -1304,7 +1306,7 @@ class Api:
         _os._exit(0)
 
     def toggle_pin(self):
-        """切换悬浮窗置顶/取消置顶"""
+        """切换悬浮窗置顶/取消置顶（保留：托盘等入口仍可用）"""
         w = self._float_window
         if not w:
             return {"ok": False, "msg": "无悬浮窗"}
@@ -1315,6 +1317,14 @@ class Api:
         except Exception as e:
             self._float_on_top = not self._float_on_top
             return {"ok": False, "msg": str(e)[:80]}
+
+    def toggle_fixed(self):
+        """切换悬浮窗固定位置（锁定，禁止拖动），偏好持久化"""
+        self._float_fixed = not self._float_fixed
+        cfg = load_ui_config()
+        cfg["fixed"] = self._float_fixed
+        save_ui_config(cfg)
+        return {"ok": True, "fixed": self._float_fixed}
 
     def toggle_collapse(self):
         """已移除收起功能：悬浮窗固定展开，此方法保留兼容返回 False 状态"""
@@ -4030,7 +4040,7 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
     <span class="btns">
       <button id="themeBtn" onclick="toggleTheme()" title="切换深色/浅色主题">🌙</button>
       <button id="maskbtn" onclick="toggleMaskMini()" title="隐藏金额：开">🙈</button>
-      <button id="pinbtn" class="pin on" onclick="togglePin()" title="置顶：开">📌</button>
+      <button id="pinbtn" class="pin on" onclick="togglePin()" title="固定位置：开（点击解锁拖动）">📌</button>
       <button class="tray" onclick="hideToTray()" title="隐藏到系统托盘（右键托盘可彻底退出）">⬇</button>
     </span>
   </div>
@@ -4141,15 +4151,25 @@ async function toggleMaskMini(){
   if(r && r.ok) applyMaskState(!!r.mask);
 }
 
-async function togglePin(){
-  const r=await pywebview.api.toggle_pin();
-  if(r && r.ok){
-    const b=document.getElementById('pinbtn');
-    if(!b) return;
-    // 固定位置开关：图标不变，用高亮状态表示置顶开/关
-    b.classList.toggle('on', !!r.on_top);
-    b.title=r.on_top?'置顶：开（点击取消）':'置顶：关（点击置顶）';
+let _fixedBlock=null;
+function setFixed(fixed){
+  const b=document.getElementById('pinbtn');
+  if(b){
+    b.classList.toggle('on', !!fixed);
+    b.title=fixed?'固定位置：开（点击解锁拖动）':'固定位置：关（点击固定）';
   }
+  // 固定 = 锁定悬浮窗在当前位置：捕获阶段拦截 mousedown，阻止 pywebview 的 easy_drag 拖动
+  if(fixed && !_fixedBlock){
+    _fixedBlock=function(e){e.stopPropagation();};
+    window.addEventListener('mousedown', _fixedBlock, true);
+  } else if(!fixed && _fixedBlock){
+    window.removeEventListener('mousedown', _fixedBlock, true);
+    _fixedBlock=null;
+  }
+}
+async function togglePin(){
+  const r=await pywebview.api.toggle_fixed();
+  if(r && r.ok) setFixed(!!r.fixed);
 }
 
 async function toggleBoot(){
@@ -4179,6 +4199,7 @@ window.addEventListener('pywebviewready',()=>{
     if(r && r.ok){
       applyBootState(!!r.autostart);
       applyMaskState(!!r.mask);
+      setFixed(!!r.fixed);
     }
   });
   // 今日分析持久化：重启后把今天已保存的分析报告渲染出来
@@ -4224,6 +4245,9 @@ def main():
 
         def toggle_pin(self):
             return api.toggle_pin()
+
+        def toggle_fixed(self):
+            return api.toggle_fixed()
 
         def toggle_collapse(self):
             return api.toggle_collapse()
