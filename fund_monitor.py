@@ -87,7 +87,7 @@ def _single_instance_check():
 
 def load_ui_config():
     """读取 UI 偏好：collapsed(悬浮窗是否收起)、mask(默认隐藏金额)、autostart(开机自启)"""
-    default = {"collapsed": True, "mask": True, "autostart": False}
+    default = {"collapsed": False, "mask": True, "autostart": False}
     try:
         with open(UI_CONFIG_FILE, "r", encoding="utf-8") as f:
             return {**default, **json.load(f)}
@@ -687,7 +687,7 @@ class Api:
         self._review_summary = None  # 收盘后复盘的汇总缓存
         self._state_lock = threading.RLock()  # 保护 data/info 读写，避免加载中并发渲染错乱
         _ui = load_ui_config()
-        self._float_collapsed = bool(_ui.get("collapsed", True))  # 悬浮窗默认收起小条
+        self._float_collapsed = False  # 悬浮窗固定展开（已彻底移除收起功能）
         self._float_on_top = True  # 悬浮窗是否置顶
         self._mask_amount = bool(_ui.get("mask", True))  # 默认隐藏金额（总资产/闲钱打码）
         self.idle_cash = load_idle_cash()  # 闲钱（可用于加减仓的闲置资金）
@@ -823,7 +823,6 @@ class Api:
             "idle_cash": self.idle_cash,
             "rate_points": self._rate_history.get(datetime.now().strftime("%Y-%m-%d"), []),
             "mask": self._mask_amount,
-            "collapsed": self._float_collapsed,
         }
 
     def add_fund(self, code, amount, confirm_days=1):
@@ -1173,16 +1172,13 @@ class Api:
         return {"ok": True}
 
     def show_floating(self):
-        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（按保存的偏好恢复收起/展开）"""
+        """切换到悬浮窗：隐藏主窗口，显示置顶小窗（固定展开，不缩成条）"""
         if not self._float_window:
             return {"ok": False, "msg": "无悬浮窗"}
         try:
             self._main_window.hide()
             self._float_window.show()
             self._main_visible = False
-            # 若保存的是收起态，确保窗口尺寸/位置为收起状态
-            if self._float_collapsed:
-                self._apply_float_size()
         except Exception as e:
             print("show_floating 异常:", e)
             # 悬浮窗失败时恢复主窗口，避免用户什么都看不到
@@ -1268,7 +1264,6 @@ class Api:
             "ok": True,
             "mask": self._mask_amount,
             "autostart": _autostart_enabled(),
-            "collapsed": self._float_collapsed,
         }
 
     def quit_app(self):
@@ -1302,40 +1297,8 @@ class Api:
             return {"ok": False, "msg": str(e)[:80]}
 
     def toggle_collapse(self):
-        """收起/展开悬浮窗：收起时缩成小条贴屏幕右下角，展开恢复"""
-        w = self._float_window
-        if not w:
-            return {"ok": False, "msg": "无悬浮窗"}
-        try:
-            self._float_collapsed = not self._float_collapsed
-            self._apply_float_size()
-            # 偏好持久化
-            cfg = load_ui_config()
-            cfg["collapsed"] = self._float_collapsed
-            save_ui_config(cfg)
-            return {"ok": True, "collapsed": self._float_collapsed}
-        except Exception as e:
-            self._float_collapsed = not self._float_collapsed
-            return {"ok": False, "msg": str(e)[:80]}
-
-    def _apply_float_size(self):
-        """按当前收起/展开状态设置悬浮窗尺寸与位置（工作区内，避开任务栏）"""
-        w = self._float_window
-        if not w:
-            return
-        if self._float_collapsed:
-            cw, ch = 260, 72
-        else:
-            cw, ch = 378, 516
-        w.resize(cw, ch)
-        # 用排除任务栏后的可用区域定位，避免收起窗口压在底部任务栏上
-        wax, way, waw, wah = _work_area()
-        margin = 14
-        x = max(wax, wax + waw - cw - margin)
-        y = max(way, way + wah - ch - margin)
-        w.move(x, y)
-        # resize/move 后重新置顶，避免丢失 z-order 被其他窗口盖住
-        _set_topmost(w, self._float_on_top)
+        """已移除收起功能：悬浮窗固定展开，此方法保留兼容返回 False 状态"""
+        return {"ok": True, "collapsed": False}
 
     # ---------- 分析模式 API ----------
     def get_analysis_config(self):
@@ -3995,20 +3958,6 @@ body{background:var(--bg);color:var(--txt);overflow:hidden;font-size:13px;
 .bar button{flex:1;cursor:pointer;border:none;border-radius:8px;padding:8px 0;
   font-size:12px;font-weight:600;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand))}
 .bar button.close{background:linear-gradient(135deg,var(--sub),var(--sub))}
-
-/* 收起态（缩小到右下角） */
-.collapsed{display:none;flex:1;align-items:center;gap:10px}
-.collapsed .c-info{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
-.collapsed .c-item{font-size:11px;color:var(--sub);white-space:nowrap}
-.collapsed .c-item b{color:var(--txt);font-size:13px;font-variant-numeric:tabular-nums;margin-left:4px}
-.collapsed .expand{cursor:pointer;border:none;border-radius:8px;width:34px;height:34px;
-  font-size:16px;line-height:1;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand))}
-body.collapsed .titlebar{display:none}
-body.collapsed .sum{display:none}
-body.collapsed .list{display:none}
-body.collapsed .bar{display:none}
-body.collapsed .collapsed{display:flex}
-body.collapsed #mini{padding:10px 12px;gap:0}
 ::-webkit-scrollbar{width:6px}
 ::-webkit-scrollbar-thumb{background:var(--scrollbar);border-radius:3px}
 </style>
@@ -4039,13 +3988,6 @@ body.collapsed #mini{padding:10px 12px;gap:0}
   <div class="bar">
     <button class="close" onclick="hideToTray()" title="隐藏到系统托盘（右键托盘可彻底退出）">隐藏到托盘</button>
     <button onclick="expand()">展开完整版</button>
-  </div>
-  <div class="collapsed">
-    <div class="c-info">
-      <span class="c-item">总资产<b id="c-total">--</b></span>
-      <span class="c-item">今日收益<b id="c-profit">--</b></span>
-    </div>
-    <button class="expand" onclick="toggleCollapse()" title="展开">⤢</button>
   </div>
 </div>
 
@@ -4082,10 +4024,6 @@ function toggleTheme(){
 
 function render(st){
   state=st;
-  // 收起态与 Python 状态同步（默认收起小条）
-  if(typeof st.collapsed!=='undefined'){
-    document.body.classList.toggle('collapsed', !!st.collapsed);
-  }
   // 收益卡片标题动态化（与主窗口一致）
   const fl=st.funds||[];
   const anyEst=fl.some(f=>f.est);
@@ -4109,11 +4047,6 @@ function render(st){
   const ce=document.getElementById('cum-rate');
   ce.textContent=cr==null?'--':'累计 '+sgn(cr)+'%';
   ce.className='v '+cls(cr);
-  // 收起态小条同步
-  document.getElementById('c-total').textContent=masked?'****':fmt(st.total);
-  const cp=document.getElementById('c-profit');
-  cp.textContent=(st.profit>0?'+':'')+fmt(st.profit);
-  cp.className='c-profit '+cls(st.profit);
   const list=document.getElementById('list');
   if(!st.funds.length){list.innerHTML='<div class="empty">暂无持仓</div>';return;}
   // 排序：先按涨幅降序，涨幅相同再按持仓占比降序
@@ -4161,10 +4094,8 @@ function applyBootState(on){
 }
 
 async function toggleCollapse(){
-  const r=await pywebview.api.toggle_collapse();
-  if(r && r.ok){
-    document.body.classList.toggle('collapsed', !!r.collapsed);
-  }
+  // 收起功能已移除，悬浮窗固定展开
+  return;
 }
 
 window.addEventListener('pywebviewready',()=>{
