@@ -22,9 +22,10 @@ cd 项目目录
 pyinstaller --onefile --noconsole --name 基金监控 --hidden-import=clr --hidden-import=openai \
   --icon app.ico --add-data "app.ico;." --clean fund_monitor.py
 rm -rf build __pycache__
-cp dist/基金监控.exe 桌面路径
 ```
-- 注意：桌面 exe 正在运行时无法覆盖，必须先杀进程
+- 产物：`dist\基金监控.exe`，**只放项目目录，不再复制到桌面**（2026-08-18 用户约定）
+- 如需更新运行版：手动把 exe 复制到 `桌面\workBuddy工具\基金监控\`（数据文件所在目录），注意 exe 正在运行时无法覆盖，必须先退出
+- 打包也可用一键脚本：`python build.py --venv .venv --skip-install`
 
 ## 数据文件（exe 同目录）
 | 文件 | 内容 |
@@ -35,6 +36,9 @@ cp dist/基金监控.exe 桌面路径
 | analysis_config.json | LLM key/model/base_url |
 | analysis_history.json | 每日预测（predictions/reports/portfolio） |
 | signals.json | 信号库（胜率统计） |
+| trade_review.json | 加减仓建议复盘记录 |
+| prediction_lessons.json | 预测复盘经验教训缓存（喂回下次分析） |
+| review_results.json | 按目标日缓存的复盘结果（打开直接显示，不用重新复盘，v2.0.19+） |
 
 ## 数据源（免费公开接口）
 - 实时行情：`http://qt.gtimg.cn/q=jj{code}`（GBK 编码；**p[2]估算净值可能为空→用 p[5]官方净值兜底**；qdate 从 p[8] 解析）
