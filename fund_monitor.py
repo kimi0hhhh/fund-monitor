@@ -1824,10 +1824,11 @@ class Api:
     def review_trade_reviews(self):
         """AI 复盘待复盘的加减仓建议：如果当时听从了建议会盈利还是亏损
 
-        锚点：23:00 只复盘「对今天（forecast_date=今日）」的加减仓建议——
-        即昨天收盘后/今天盘中给出的、目标日是今天的建议（"昨天对今天的建议复盘"）。
-        只在开市日 23:00 后复盘（等当日净值更新完）；休市日不复盘。
-        旧数据无 forecast_date 的，fallback 按生成日 < 今天（原逻辑）。
+        按目标日（forecast_date）判断：
+        - 历史漏网（目标日早于今天，如昨天/前天没自动复盘）：任何时间点击即可补复盘（净值早已更新）
+        - 对今天（目标日=今天）：需 23:00 后（等当日净值更新完）
+        - 未来（目标日晚于今天）：需等该日收盘后
+        只在开市日复盘；休市日不复盘。旧数据无 forecast_date 的，按生成日 < 今天（原逻辑）。
         """
         if fa is None:
             return {"ok": False, "msg": "模块未加载"}
@@ -1835,15 +1836,18 @@ class Api:
             return {"ok": False, "msg": "请先配置 LLM API key"}
         if not is_market_open_today():
             return {"ok": False, "msg": "今天休市，加减仓建议将在下一个开市日收盘后自动复盘"}
-        if datetime.now().hour < 23:
-            return {"ok": False, "msg": "基金当日净值尚未更新完，复盘将在 23:00 后自动进行"}
         reviews = fa.load_trade_reviews()
         today = datetime.now().strftime("%Y-%m-%d")
+        now_hour = datetime.now().hour
 
         def _due(r):
             fd = str(r.get("forecast_date") or "").strip()
             if fd:
-                return fd <= today          # 对今天及以前的建议（今天复盘"对今天"+补历史漏网）
+                if fd < today:
+                    return True              # 历史漏网：随时补复盘（净值已更新）
+                if fd == today:
+                    return now_hour >= 23    # 对今天：等当日净值更新完（23:00 后）
+                return False                 # 未来
             return str(r.get("date", "")) < today  # 旧数据：生成日早于今天
 
         pending = [r for r in reviews
@@ -1851,10 +1855,10 @@ class Api:
         if not pending:
             future = [r for r in reviews
                       if r.get("status") == "pending"
-                      and str(r.get("forecast_date") or r.get("date", "")) > today]
+                      and str(r.get("forecast_date") or r.get("date", "")) >= today]
             if future:
                 fd = future[0].get("forecast_date") or future[0].get("date")
-                return {"ok": False, "msg": f"对 {fd} 的加减仓建议需等该日收盘后自动复盘"}
+                return {"ok": False, "msg": f"对 {fd} 的加减仓建议需等该日收盘后（23:00）自动复盘"}
             return {"ok": False, "msg": "没有待复盘的加减仓建议"}
         task_id = uuid.uuid4().hex[:8]
         self._tasks[task_id] = {"status": "running", "progress": 0,
@@ -3326,10 +3330,11 @@ async function autoReviewTrades(){
   if(now-lastAutoReview<60000) return;
   const r=await pywebview.api.get_trade_reviews();
   if(!r.ok) return;
-  // 只在开市日收盘后自动复盘（后端也会校验，这里提前跳过不打扰）
-  if(!r.market_open || !r.market_closed) return;
   const today=r.today||'';
-  const pendings=(r.reviews||[]).filter(x=>x.status==='pending' && x.date<today);
+  // 点击页面/启动即检查：有历史待复盘（目标日早于今天，如前天/昨天漏掉的）就自动补复盘；
+  // 「对今天」的建议由后端按 23:00 判断；休市日由后端拦截
+  const pendings=(r.reviews||[]).filter(x=>x.status==='pending' &&
+    String(x.forecast_date||x.date||'') < today);
   if(pendings.length){ lastAutoReview=now; reviewTradeReviews(); }
 }
 
