@@ -15,7 +15,10 @@ signals.json
 trade_review.json
 trade_lessons.json
 prediction_lessons.json
+review_results.json
 ui_config.json
+proxy_config.json
+*.bak
 
 # 系统文件
 Thumbs.db
