@@ -4163,7 +4163,8 @@ def main():
 
     main_window = webview.create_window(
         "我的基金监控", html=HTML_MAIN, js_api=api,
-        width=1080, height=720, min_size=(900, 600),
+        # 主窗口默认宽度按用户当前窗口实际宽度固定（1431px，2026-08-18 用户要求）
+        width=1431, height=720, min_size=(900, 600),
         background_color="#f2f2f7",
     )
     float_window = webview.create_window(
