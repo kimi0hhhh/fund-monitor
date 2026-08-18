@@ -1134,6 +1134,7 @@ class Api:
         """复盘最近一个有实际结果的历史预测，缓存方向正确率与平均准确率
 
         始终尝试（不限定收盘后），找到最近一个能复盘出结果的日期（有后续交易日数据）。
+        优先用 review_results.json 里已保存的复盘结果，避免每次启动/刷新重新复盘。
         """
         if fa is None:
             return
@@ -1141,11 +1142,14 @@ class Api:
         if self._review_summary and self._review_summary.get("computed_on") == today:
             return
         try:
+            cached = fa.load_review_results()
             for d in fa.list_history_dates():
                 if d >= today:
                     continue
-                result = fa.review_all_predictions(d)
-                if result.get("ok") and result.get("total"):
+                result = cached.get(d)
+                if result is None:
+                    result = fa.review_all_predictions(d)
+                if result and result.get("ok") and result.get("total"):
                     self._review_summary = {
                         "computed_on": today,
                         "date": d,
@@ -1345,6 +1349,7 @@ class Api:
                 "trade_review.json": fa.TRADE_REVIEW_FILE,
                 "trade_lessons.json": fa.TRADE_LESSONS_FILE,
                 "prediction_lessons.json": fa.PREDICTION_LESSONS_FILE,
+                "review_results.json": fa.REVIEW_RESULT_FILE,
             })
         return files
 
@@ -1988,6 +1993,13 @@ class Api:
                     self._tasks[task_id] = {"status": "running", "progress": 90,
                                             "msg": "提炼预测经验教训..."}
                     fa.summarize_prediction_lessons(fd, result)
+                    # 复盘结果持久化：存到 review_results.json，下次打开直接显示，不用重新复盘
+                    try:
+                        _cache = fa.load_review_results()
+                        _cache[fd] = result
+                        fa.save_review_results(_cache)
+                    except Exception:
+                        pass
                 self._tasks[task_id] = {
                     "status": "done" if result.get("ok") else "error",
                     "progress": 100, "result": result}
@@ -1998,6 +2010,18 @@ class Api:
 
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "task_id": task_id}
+
+    def get_review_result(self, fd):
+        """返回已保存的复盘结果（review_results.json 按目标日缓存），打开复盘页直接显示"""
+        if fa is None:
+            return {"ok": False, "msg": "模块未加载"}
+        try:
+            r = fa.load_review_results().get(fd)
+            if r:
+                return {"ok": True, "cached": True, "result": r}
+        except Exception:
+            pass
+        return {"ok": False, "msg": "该日暂无已保存的复盘结果"}
 
 
 HTML_MAIN = r"""<!DOCTYPE html>
@@ -2419,7 +2443,7 @@ tbody tr:last-child td{border-bottom:none}
     <div id="ana-pane-review" style="display:none">
       <div class="ana-bar">
         <label>选择预测目标日：</label>
-        <select id="rev_date"></select>
+        <select id="rev_date" onchange="loadCachedReview(this.value)"></select>
         <button class="btn btn-add" onclick="doReviewAll()" style="background:linear-gradient(135deg,var(--down),var(--down))">📋 复盘对所选日的全部预测</button>
       </div>
       <div id="rev-progress" style="display:none" class="ana-progress">
@@ -3716,6 +3740,27 @@ async function refreshReviewDates(){
   if(!sel) return;
   const dates = await pywebview.api.list_history_dates();
   sel.innerHTML = dates.map(d=>'<option value="'+d+'">对 '+String(d).slice(5)+' 日</option>').join('');
+  // 打开复盘页：直接显示最近目标日已保存的复盘结果，不用重新复盘
+  if(dates.length){
+    sel.value = dates[0];
+    loadCachedReview(dates[0]);
+  }
+}
+
+async function loadCachedReview(fd){
+  const out = document.getElementById('rev-result');
+  if(!out) return;
+  const r = await pywebview.api.get_review_result(fd);
+  if(r && r.ok){
+    // 顶部提示这是已保存的复盘结果，可点按钮强制重新复盘
+    out.dataset.cached = '1';
+    renderReviewAll(r.result, out);
+    out.insertAdjacentHTML('afterbegin',
+      '<div style="font-size:12px;color:var(--sub);margin-bottom:8px">📁 已保存的复盘结果（'+esc(fd)+'）——如需更新，点上方「复盘对所选日的全部预测」重新复盘</div>');
+  } else {
+    out.dataset.cached = '0';
+    out.innerHTML = '<div class="empty-state">该日还没有复盘结果。点上方「📋 复盘对所选日的全部预测」生成后会自动保存，下次打开直接显示。</div>';
+  }
 }
 
 async function doReviewAll(){

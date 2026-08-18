@@ -27,6 +27,7 @@ SIGNALS_FILE = os.path.join(BASE_DIR, "signals.json")
 TRADE_REVIEW_FILE = os.path.join(BASE_DIR, "trade_review.json")
 TRADE_LESSONS_FILE = os.path.join(BASE_DIR, "trade_lessons.json")
 PREDICTION_LESSONS_FILE = os.path.join(BASE_DIR, "prediction_lessons.json")
+REVIEW_RESULT_FILE = os.path.join(BASE_DIR, "review_results.json")  # 按目标日缓存的复盘结果（打开直接显示，不用重新复盘）
 PROXY_FILE = os.path.join(BASE_DIR, "proxy_config.json")
 
 HEADERS = {
@@ -613,6 +614,33 @@ def add_signals_from_report(code, report):
 
 
 # ================== 加减仓复盘 ==================
+def _atomic_write_json(path, data):
+    """原子写 JSON：先写临时文件再替换，避免中途崩溃导致文件全零损坏"""
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def load_review_results():
+    """读取按目标日缓存的复盘结果：{"目标日": 完整复盘结果 dict}"""
+    try:
+        if os.path.exists(REVIEW_RESULT_FILE):
+            with open(REVIEW_RESULT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_review_results(data):
+    """保存按目标日缓存的复盘结果（原子写）"""
+    _atomic_write_json(REVIEW_RESULT_FILE, data or {})
+
+
 def load_trade_reviews():
     try:
         if os.path.exists(TRADE_REVIEW_FILE):
