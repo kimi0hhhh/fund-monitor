@@ -1269,6 +1269,66 @@ def save_trade_reviews(reviews):
         pass
 
 
+def _kelly_stats():
+    """从已复盘加减仓建议算 half-Kelly 参数：胜率、平均盈利幅度、平均亏损幅度。
+
+    用 review 的 pnl_pct（已扣交易成本的净盈亏）。无有效样本返回 None。
+    """
+    reviews = load_trade_reviews()
+    reviewed = [r for r in reviews if r.get("status") == "reviewed"]
+    wins = []
+    losses = []
+    for r in reviewed:
+        pnl = (r.get("review") or {}).get("pnl_pct")
+        try:
+            pnl = float(pnl)
+        except (TypeError, ValueError):
+            continue
+        if pnl > 0:
+            wins.append(pnl)
+        elif pnl < 0:
+            losses.append(-pnl)
+    if not wins or not losses:
+        return None
+    win_rate = len(wins) / (len(wins) + len(losses))
+    avg_win = sum(wins) / len(wins)
+    avg_loss = sum(losses) / len(losses)
+    return win_rate, avg_win, avg_loss
+
+
+def _half_kelly_position(win_rate, avg_win, avg_loss):
+    """half-Kelly 仓位比例（0~1）：f = 0.5 × (b·p − q) / b
+
+    b = avg_win / avg_loss（赔率），p = win_rate，q = 1 − p。
+    凯利为负 → 0（不下注）；无有效参数 → None。
+    """
+    if not avg_loss or not avg_win:
+        return None
+    b = avg_win / avg_loss
+    q = 1.0 - win_rate
+    f = (b * win_rate - q) / b
+    if f <= 0:
+        return 0.0
+    return min(f * 0.5, 1.0)
+
+
+def _apply_half_kelly(verdict, position_change):
+    """用 half-Kelly 覆盖加减仓建议的仓位幅度（替代 LLM 拍脑袋）。
+
+    有历史复盘数据时算 half-Kelly 仓位并生成规范文本；否则保留 LLM 原值（冷启动兜底）。
+    """
+    ks = _kelly_stats()
+    if not ks:
+        return position_change
+    win_rate, avg_win, avg_loss = ks
+    f = _half_kelly_position(win_rate, avg_win, avg_loss)
+    if f is None or f <= 0:
+        return position_change  # 凯利为负/无有效参数 → 保留原值
+    pct = round(f * 100, 1)
+    sign = "+" if verdict in ("BUY", "ADD") else "-"
+    return f"{sign}{pct}%（half-Kelly）"
+
+
 def add_trade_review_from_report(code, name, report, nav=None, pct=None):
     """从分析报告提取加减仓建议（非 HOLD/维持）存入复盘库
 
@@ -1284,6 +1344,8 @@ def add_trade_review_from_report(code, name, report, nav=None, pct=None):
     position_change = str(act.get("position_change", "") or "").strip()
     if not position_change or position_change in ("持有不动", "N/A", "维持", "持有"):
         return
+    # half-Kelly 覆盖仓位幅度（有历史复盘数据时，替代 LLM 拍脑袋的数字）
+    position_change = _apply_half_kelly(verdict, position_change)
     reviews = load_trade_reviews()
     today = datetime.now().strftime("%Y-%m-%d")
     fd = compute_forecast_date()
@@ -1327,13 +1389,99 @@ def trade_review_stats(reviews=None):
             "profit_rate": profit_rate, "avg_pnl": avg_pnl}
 
 
-def review_trade_advice(advice, quote):
-    """AI 复盘单条加减仓建议：如果当时听从了建议，到现在会盈利还是亏损
+def _hold_days(date_str):
+    """建议日期 → 今天的持有天数（解析失败返回 None）"""
+    try:
+        d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+        return (datetime.now() - d).days
+    except (ValueError, TypeError):
+        return None
 
-    quote: 当前最新行情摘要（如 "易方达蓝筹 净值 2.9012 今日 +0.85%"）
+
+def _trade_cost_pct(verdict, hold_days):
+    """估算加减仓建议的交易成本（%）：申购费 + 按持有期的赎回费
+
+    BUY/ADD（买入/加仓）：申购费 0.1% + 赎回费（假设复盘时平仓落袋，按持有期）
+    SELL/REDUCE（卖出/减仓）：赎回费（按持有期，申购费在更早买入时已付）
+    QDII/短持有期赎回费更高，此处按 A 股基金常见费率阶梯估算。
+    """
+    purchase_fee = 0.10
+    if hold_days is not None and hold_days < 7:
+        redeem_fee = 1.50
+    elif hold_days is not None and hold_days < 30:
+        redeem_fee = 0.50
+    else:
+        redeem_fee = 0.0
+    if verdict in ("BUY", "ADD"):
+        return round(purchase_fee + redeem_fee, 2)
+    return round(redeem_fee, 2)
+
+
+def review_trade_advice(advice, quote, target_nav=None):
+    """复盘单条加减仓建议：如果当时听从了建议，到现在会盈利还是亏损
+
+    pnl 确定性计算（不靠 LLM 估算，避免幻觉与算术错误）：
+      BUY/ADD（买入/加仓）: pnl = (target_nav / ref_nav - 1) × 100
+      SELL/REDUCE（卖出/减仓）: pnl = (1 - target_nav / ref_nav) × 100
+    LLM 只负责归因（bias_type / reason）。target_nav 缺失时退回纯 LLM 估算（兼容旧调用）。
+
+    quote: 当前最新行情摘要；target_nav: 复盘时最新净值（确定性 pnl 的分子）
     返回 {"result": "盈利/亏损/持平", "pnl_pct": 数字, "reason": "偏差原因",
           "bias_type": "偏差类型"} 或 None
     """
+    ref_nav = advice.get("ref_nav")
+    verdict = str(advice.get("verdict", "") or "").strip().upper()
+    # ---- 确定性 pnl（优先，LLM 不做算术），扣交易成本后为净盈亏 ----
+    pnl = result = net_pnl = cost_pct = None
+    if ref_nav and target_nav:
+        try:
+            _ref = float(ref_nav)
+            _tgt = float(target_nav)
+            if _ref > 0:
+                if verdict in ("BUY", "ADD"):
+                    pnl = round((_tgt / _ref - 1) * 100, 2)
+                elif verdict in ("SELL", "REDUCE"):
+                    pnl = round((1 - _tgt / _ref) * 100, 2)
+                if pnl is not None:
+                    cost_pct = _trade_cost_pct(verdict, _hold_days(advice.get("date")))
+                    net_pnl = round(pnl - cost_pct, 2)
+                    result = "盈利" if net_pnl > 0.1 else ("亏损" if net_pnl < -0.1 else "持平")
+        except (TypeError, ValueError):
+            pnl = result = net_pnl = cost_pct = None
+
+    if pnl is not None and result is not None:
+        # 盈亏已确定性算出，LLM 只做偏差归因
+        sys_p = (
+            "你是交易复盘分析师。给定一条过去的加减仓建议（含建议时净值）和已确定的复盘盈亏，"
+            "分析这条建议产生该结果的最可能偏差原因。\n"
+            "输出 JSON：{\"bias_type\": \"偏差类型\", \"reason\": \"偏差原因(60字内)\"}\n"
+            "bias_type 只能从以下选一个：方向误判 / 时机过早或过晚 / 追涨杀跌情绪化 / 幅度误判 / 信息不足 / 其他\n"
+            "只输出 JSON，不要任何额外文字。"
+        )
+        user_p = (
+            f"基金：{advice.get('name','')}（{advice.get('code','')}）\n"
+            f"建议日期：{advice.get('date','-')}  操作：{advice.get('verdict','-')}（{advice.get('position_change','-')}）\n"
+            f"建议理由：{advice.get('rationale','-')}\n"
+            f"建议时净值：{advice.get('ref_nav','-')}\n"
+            f"复盘盈亏（确定性计算，已扣交易成本 {cost_pct}%）：净 {net_pnl}%（毛 {pnl}%）\n"
+            f"最新行情：{quote or '暂无行情数据'}"
+        )
+        r = llm_chat([{"role": "system", "content": sys_p},
+                      {"role": "user", "content": user_p}], temperature=0.3, max_tokens=250)
+        reason = ""
+        bias_type = "其他"
+        if r.get("ok"):
+            parsed = parse_llm_json(r.get("content", ""))
+            if parsed:
+                reason = str(parsed.get("reason", "")).strip()
+                bt = str(parsed.get("bias_type", "")).strip()
+                if bt in ("方向误判", "时机过早或过晚", "追涨杀跌情绪化",
+                          "幅度误判", "信息不足", "其他"):
+                    bias_type = bt
+        return {"result": result, "pnl_pct": net_pnl, "gross_pnl": pnl,
+                "cost_pct": cost_pct, "reason": reason, "bias_type": bias_type}
+
+    # ---- fallback：无 target_nav/ref_nav 时退回纯 LLM 估算（兼容旧调用）----
     sys_p = (
         "你是交易复盘分析师。给定一条过去的加减仓建议（含建议时的净值/涨跌）和当前最新行情，"
         "判断：如果当时真的听从了这条建议操作，到现在是盈利还是亏损。\n"
@@ -1391,6 +1539,44 @@ def save_trade_lessons(data):
         pass
 
 
+def _norm_lessons(lessons):
+    """把 LLM 输出的 lessons 规范化为结构化列表（FinVision 式 reflection）：
+    每条 {bias_type, pattern, evidence, action}。
+
+    兼容旧格式（字符串列表）→ {pattern: 文本, bias_type: "其他", action: "", evidence: ""}。
+    """
+    out = []
+    if not lessons:
+        return out
+    for x in lessons:
+        if isinstance(x, dict):
+            out.append({
+                "bias_type": str(x.get("bias_type") or "其他").strip(),
+                "pattern": str(x.get("pattern") or "").strip(),
+                "evidence": str(x.get("evidence") or "").strip(),
+                "action": str(x.get("action") or "").strip(),
+            })
+        else:
+            t = str(x).strip()
+            if t:
+                out.append({"bias_type": "其他", "pattern": t, "evidence": "", "action": ""})
+    return out
+
+
+def _fmt_lessons(lessons):
+    """结构化 lessons → 喂回文本（兼容旧字符串格式）"""
+    parts = []
+    for x in lessons:
+        if isinstance(x, dict):
+            s = f"[{x.get('bias_type', '其他')}] {x.get('pattern', '')}"
+            if x.get("action"):
+                s += f" → 改进：{x['action']}"
+            parts.append(s)
+        else:
+            parts.append(str(x))
+    return "；".join(parts)
+
+
 def summarize_trade_lessons():
     """复盘完成后调用一次：把已复盘记录的偏差类型+原因汇总，提炼成经验教训缓存
 
@@ -1420,8 +1606,9 @@ def summarize_trade_lessons():
     sys_p = (
         "你是交易复盘教练。根据用户加减仓建议的历史复盘记录（含偏差类型与原因），"
         "提炼 3-6 条可执行的交易经验教训，帮助后续分析避免同类错误。\n"
-        "输出 JSON：{\"lessons\": [\"经验1\", \"经验2\", ...]}，每条 40 字内，"
-        "针对偏差类型给出具体改进动作。只输出 JSON。"
+        "输出 JSON：{\"lessons\": [{\"bias_type\": \"方向误判/时机过早或过晚/追涨杀跌情绪化/幅度误判/信息不足/其他\", "
+        "\"pattern\": \"错误模式(20字内)\", \"evidence\": \"支撑案例(可空)\", \"action\": \"改进动作(30字内)\"}, ...]}。"
+        "每条必须给出具体的改进动作，bias_type 从给定选项里选。只输出 JSON。"
     )
     user_p = (
         f"整体：共 {st['reviewed']} 条已复盘，盈利 {st['profit']} / 亏损 {st['loss']} / 持平 {st['flat']}，"
@@ -1435,7 +1622,7 @@ def summarize_trade_lessons():
     if r.get("ok"):
         parsed = parse_llm_json(r.get("content", ""))
         if parsed and isinstance(parsed.get("lessons"), list):
-            lessons = [str(x).strip() for x in parsed["lessons"] if str(x).strip()]
+            lessons = _norm_lessons(parsed["lessons"])
     data = {"lessons": lessons, "updated": datetime.now().strftime("%Y-%m-%d"),
             "stats": {"reviewed": st["reviewed"], "profit_rate": st["profit_rate"],
                       "avg_pnl": st["avg_pnl"]}}
@@ -1464,10 +1651,10 @@ def build_trade_review_context():
         bias_desc = "，".join(f"{k} {v}条" for k, v in
                               sorted(bias_cnt.items(), key=lambda x: -x[1]))
         lines.append(f"偏差类型分布：{bias_desc}")
-    # 经验教训（复盘完成后的缓存）
+    # 经验教训（复盘完成后的缓存，结构化 reflection）
     lessons = load_trade_lessons().get("lessons") or []
     if lessons:
-        lines.append("复盘经验教训：" + "；".join(lessons))
+        lines.append("复盘经验教训（结构化）：" + _fmt_lessons(lessons))
     # 最近 3 条亏损案例
     losses = [r for r in reviewed if (r.get("review") or {}).get("result") == "亏损"][-3:]
     for r in losses:
@@ -1999,6 +2186,79 @@ def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=No
     }
 
 
+# ================== 预测评估层（IC / DM / Brier） ==================
+def _rank_avg(vals):
+    """平均秩（处理并列），返回 1-based 秩列表"""
+    n = len(vals)
+    order = sorted(range(n), key=lambda i: vals[i])
+    ranks = [0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and vals[order[j + 1]] == vals[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _spearman_ic(preds, actuals):
+    """横截面 IC（Grinold-Kahn）：预测值排序 vs 实际值排序的 Spearman 秩相关。
+
+    组合多只基金时衡量「预测的横截面排序是否与实际一致」，|IC|>0.03 才算有预测力。
+    样本 <5 或秩方差为 0（全并列）返回 None。
+    """
+    n = len(preds)
+    if n < 5:
+        return None
+    rp = _rank_avg(preds)
+    ra = _rank_avg(actuals)
+    mp = sum(rp) / n
+    ma = sum(ra) / n
+    cov = sum((rp[i] - mp) * (ra[i] - ma) for i in range(n))
+    vp = sum((x - mp) ** 2 for x in rp)
+    va = sum((x - ma) ** 2 for x in ra)
+    if vp <= 0 or va <= 0:
+        return None
+    return round(cov / (vp * va) ** 0.5, 3)
+
+
+def _diebold_mariano(err_ai, err_bench):
+    """Diebold-Mariano 检验（Diebold & Mariano 1995）：AI 预测误差 vs 基线误差是否显著不同。
+
+    d_t = err_ai_t - err_bench_t；DM = mean(d)/se(d)。
+    mean_d < 0 表示 AI 误差更小；|DM| > 1.96 表示差异显著（5% 水平）。
+    样本 <10 或 se=0 返回 None。
+    """
+    n = len(err_ai)
+    if n != len(err_bench) or n < 10:
+        return None
+    d = [err_ai[i] - err_bench[i] for i in range(n)]
+    md = sum(d) / n
+    var = sum((x - md) ** 2 for x in d) / (n - 1)
+    if var <= 0:
+        return None
+    se = (var / n) ** 0.5
+    dm = md / se
+    return {"dm": round(dm, 3), "significant": abs(dm) > 1.96,
+            "mean_d": round(md, 3), "n": n}
+
+
+def _brier_score(probs, outcomes):
+    """Brier score（Brier 1950）：概率预测质量，BS = (1/N)Σ(p_i - o_i)²。
+
+    probs: 校准后的方向正确概率（0~1），outcomes: 实际方向对错（0/1）。
+    BS 越低越好，0.25 = 瞎猜（50% 概率）；样本 <5 返回 None。
+    """
+    n = len(probs)
+    if n < 5:
+        return None
+    bs = sum((probs[i] - outcomes[i]) ** 2 for i in range(n)) / n
+    return round(bs, 4)
+
+
 # ================== 复盘引擎 ==================
 def compare_prediction(expected_dir, expected_pct_str, actual_pct):
     """通用对比：预测方向/幅度 vs 实际涨跌，返回准确率等"""
@@ -2169,6 +2429,8 @@ def review_all_predictions(fd):
     base_ok = []            # 有分析日当天行情的样本（基线可计算的子集）
     mom_correct = rev_correct = br_correct = 0
     mom_abs_sum = 0.0
+    dm_ai_errs = []         # DM 检验：AI 幅度误差（与动量基线配对）
+    dm_mom_errs = []        # DM 检验：动量基线幅度误差
     for code in sorted(agg.keys()):
         item = agg[code]
         pred, dstr = item["pred"], item["dstr"]
@@ -2210,6 +2472,8 @@ def review_all_predictions(fd):
         if rev_dir == actual_dir:
             rev_correct += 1
         mom_abs_sum += abs(actual_pct - base_pct)
+        dm_ai_errs.append(r.get("abs_deviation", 0))
+        dm_mom_errs.append(abs(actual_pct - base_pct))
         # 3) 历史频率：近 20 个交易日涨/跌/平哪个多就押哪个
         recent = [x.get("pct", 0) for x in h if x.get("date") <= dstr][-20:]
         ups = sum(1 for p in recent if p > 0.05)
@@ -2274,6 +2538,11 @@ def review_all_predictions(fd):
     if len(abs_devs) >= 5:
         s = sorted(abs_devs)
         conformal_q90 = round(s[min(int(len(s) * 0.9), len(s) - 1)], 2)
+    # 评估层升级：横截面 IC + Diebold-Mariano 显著性 + Brier 概率质量
+    ic = _spearman_ic([r.get("expected_pct", 0) for r in ok_results],
+                      [r.get("actual_pct", 0) for r in ok_results])
+    dm = _diebold_mariano(dm_ai_errs, dm_mom_errs)
+    brier = _brier_score([p for p, _ in platt_samples], [o for _, o in platt_samples])
     return {
         "ok": True,
         "date": fd,
@@ -2285,6 +2554,9 @@ def review_all_predictions(fd):
         "confidence_calibration": confidence_calibration,
         "platt_samples": platt_samples,
         "conformal_q90": conformal_q90,
+        "ic": ic,
+        "dm": dm,
+        "brier": brier,
     }
 
 
@@ -2388,7 +2660,9 @@ def summarize_prediction_lessons(date_str, review_result):
         "你是基金预测复盘教练。基于预测复盘数据（方向准确率 + 幅度偏差率），提炼 3-6 条可执行的"
         "预测经验教训，帮助下次分析更准确地预测方向与预期涨幅。注意：方向判对的样本里也存在幅度偏差"
         "（如预测涨 2.0% 实际涨 4.0% → 低估幅度），应针对方向误判/幅度高估/幅度低估分别给改进动作。\n"
-        "输出 JSON：{\"lessons\": [\"经验1\", \"经验2\", ...]}，每条 40 字内。只输出 JSON。"
+        "输出 JSON：{\"lessons\": [{\"bias_type\": \"方向误判/幅度高估/幅度低估/其他\", "
+        "\"pattern\": \"错误模式(20字内)\", \"evidence\": \"支撑案例(可空)\", \"action\": \"改进动作(30字内)\"}, ...]}。"
+        "每条必须给出具体的改进动作，bias_type 从给定选项里选。只输出 JSON。"
     )
     r = llm_chat([{"role": "system", "content": sys_p},
                   {"role": "user", "content": "\n".join(lines)}],
@@ -2397,7 +2671,7 @@ def summarize_prediction_lessons(date_str, review_result):
     if r.get("ok"):
         parsed = parse_llm_json(r.get("content", ""))
         if parsed and isinstance(parsed.get("lessons"), list):
-            lessons = [str(x).strip() for x in parsed["lessons"] if str(x).strip()]
+            lessons = _norm_lessons(parsed["lessons"])
     # Platt scaling 拟合（confidence_score → 真实正确概率）+ Conformal 90% 分位数（区间宽度）
     platt = None
     fit = _platt_fit(review_result.get("platt_samples"))
@@ -2568,7 +2842,7 @@ def build_prediction_review_context():
                      f"（若高信心不高于低信心，说明信心不可靠，应降低高信心档位的把握）")
     lessons = data.get("lessons") or []
     if lessons:
-        lines.append("预测经验教训：" + "；".join(lessons))
+        lines.append("预测经验教训（结构化）：" + _fmt_lessons(lessons))
     return "\n".join(lines)
 
 # ================== 中长期分析模块 ==================
@@ -2645,9 +2919,15 @@ MIDTERM_SYSTEM_PROMPT = """你是一名资深基金中长期策略师。用户�
 
 
 def build_midterm_prompt(funds, market_context=None):
-    """组装中长期分析 prompt：给每只基金的历史走势 + 技术指标 + 持仓穿透"""
+    """组装中长期分析 prompt：给每只基金的历史走势 + 技术指标 + 持仓穿透
+
+    注意：trend 与 target_range 由系统用均线/GARCH 波动率公式确定性计算（见 _apply_midterm_quant），
+    LLM 只负责方向性描述与驱动/风险/阶段计划。
+    """
     total = sum(f.get("value", 0) or 0 for f in funds) or 1.0
     parts = ["以下是用户当前全部持仓（共 %d 只，总市值 %.2f 元），请给出未来 20 个交易日（约 1 个月）的中长期分析。" % (len(funds), total)]
+    parts += ["注意：trend（趋势）与 target_range（预期区间）会由系统用技术因子/GARCH 波动率公式确定性覆盖，"
+              "你只需给出方向性描述与驱动/风险/阶段计划，数字字段可给占位值。"]
     if market_context:
         parts += ["", "【市场环境】", market_context]
     parts += [""]
@@ -2656,15 +2936,55 @@ def build_midterm_prompt(funds, market_context=None):
         name = f.get("name") or f.get("code")
         parts.append(
             f"【{f.get('code')} {name}】持仓市值 {f.get('value', 0) or 0:.0f} 元，"
+            f"当前净值 {f.get('ref_nav') or f.get('latest_gz') or '-'}，"
             f"当前估算涨幅 {f.get('gz_pct', '-')}%；"
-            f"近 60 日累计收益 {m.get('momentum_12_1_dir', '-')}（12-1月动量方向），"
-            f"波动率(年化) {m.get('volatility_annual', '-')}%，"
+            f"均线趋势 {m.get('trend', '-')}，"
+            f"12-1月动量方向 {m.get('momentum_12_1_dir', '-')}，"
+            f"12日动量方向 {m.get('mom12_dir', '-')}，"
+            f"GARCH日波动率 {m.get('cond_vol_1d', '-')}%，"
+            f"年化波动率 {m.get('volatility', '-')}%，"
             f"最大回撤 {m.get('max_drawdown', '-')}%，"
-            f"Sharpe {m.get('sharpe', '-')}，VaR95 {m.get('var95', '-')}%。"
+            f"Sharpe {m.get('sharpe', '-')}，VaR95 {m.get('var_95', '-')}%。"
             f"前十大持仓：{(f.get('holdings') or '暂无')}"
         )
     parts += ["", "请输出完整 JSON。"]
     return "\n".join(parts)
+
+
+def _apply_midterm_quant(spec, metrics, ref_nav):
+    """量化覆盖中长期关键字段（不靠 LLM 拍脑袋）：
+
+    - trend：均线多头排列（compute_metrics.trend：MA5>MA10>MA20=多头/反向=空头/否则震荡）
+      数据不足时用 12-1 动量方向兜底。
+    - target_range：GARCH 条件波动率 σ_1d → σ_20d = σ_1d·√20（独立假设），
+      80% 置信区间 = NAV·exp(±1.28·σ_20d)。
+    LLM 只负责叙事/驱动/风险，数字字段由确定性因子/公式产出。
+    """
+    import math
+    # trend 确定性判定
+    ma_trend = str(metrics.get("trend") or "").strip()
+    if ma_trend == "多头":
+        spec["trend"] = "偏多"
+    elif ma_trend == "空头":
+        spec["trend"] = "偏空"
+    elif ma_trend == "震荡":
+        spec["trend"] = "震荡"
+    else:
+        mom = metrics.get("momentum_12_1_dir")
+        spec["trend"] = {"UP": "偏多", "DOWN": "偏空"}.get(mom, "震荡")
+    # target_range 用 GARCH 条件波动率 √20 → 80% 置信区间
+    cond_vol = metrics.get("cond_vol_1d")
+    if ref_nav and cond_vol:
+        try:
+            _ref = float(ref_nav)
+            _sd1 = float(cond_vol) / 100.0            # 日波动率（小数）
+            _sd20 = _sd1 * math.sqrt(20)              # √20 缩放
+            _z = 1.28                                  # 80% 置信
+            lo = _ref * math.exp(-_z * _sd20)
+            hi = _ref * math.exp(_z * _sd20)
+            spec["target_range"] = f"{lo:.4f}-{hi:.4f}"
+        except (TypeError, ValueError):
+            pass
 
 
 def analyze_midterm(funds, progress_cb=None):
@@ -2700,14 +3020,18 @@ def analyze_midterm(funds, progress_cb=None):
     # 带分析时净值快照（供复盘对比），并给每只基金补 ref_nav 和 name（前端优先显示基金名）
     nav_map = {}
     name_map = {}
+    metrics_map = {}
     for f in funds:
         nav_map[f.get("code")] = f.get("ref_nav") or f.get("latest_gz")
         name_map[f.get("code")] = f.get("name") or f.get("code")
+        metrics_map[f.get("code")] = f.get("metrics") or {}
     raw_funds = parsed.get("funds") or {}
     funds_out = {}
     for code, spec in raw_funds.items():
         s = dict(spec) if isinstance(spec, dict) else {}
         s["name"] = name_map.get(code, code)
+        # 量化覆盖 trend / target_range（均线多头排列 + GARCH √20 波动率区间，不靠 LLM 拍）
+        _apply_midterm_quant(s, metrics_map.get(code) or {}, nav_map.get(code))
         funds_out[code] = s
     entry = {
         "analyzed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2759,6 +3083,41 @@ def get_midterm_state(target_date=None):
     return {"ok": True, "latest": latest, "history": history}
 
 
+def _winkler_score(lo, hi, actual, base, alpha=0.20):
+    """Winkler 区间评分（Gneiting & Raftery 2007），相对化到基准净值百分比。
+
+    分数越低越好：区间窄 + 不越界 = 分低（好）；区间宽或越界 = 分高（差）。
+    Winkler = 区间宽度 + (2/α)·max(lo−实际, 0) + (2/α)·max(实际−hi, 0)
+    返回 {winkler, width_pct, violated}，lo>=hi 或 base<=0 返回 None。
+    """
+    if not base or lo >= hi:
+        return None
+    width = (hi - lo) / base * 100.0
+    penalty = (2.0 / alpha) * (max(lo - actual, 0) + max(actual - hi, 0)) / base * 100.0
+    return {"winkler": round(width + penalty, 2),
+            "width_pct": round(width, 2),
+            "violated": actual < lo or actual > hi}
+
+
+def _kupiec_uc_test(hits, total, p=0.80):
+    """Kupiec 无条件覆盖检验：区间实际命中率是否与名义覆盖率 p 一致（校准质量）
+
+    LR_UC = -2 ln[ (1-p)^(n-x) p^x / ((1-x/n)^(n-x) (x/n)^x) ]
+    LR_UC > χ²(1)=3.84 → 拒绝校准（实际命中率显著偏离名义覆盖率）。
+    命中率=0 或 1、样本<10 时返回 None（无法稳定估计）。
+    """
+    if not total or total < 10 or hits <= 0 or hits >= total:
+        return None
+    import math
+    x = int(hits)
+    n = int(total)
+    actual = x / n
+    log_ratio = (n - x) * math.log((1 - p) / (1 - actual)) + x * math.log(p / actual)
+    lr_uc = -2 * log_ratio
+    return {"lr_uc": round(lr_uc, 2), "reject": bool(lr_uc > 3.84),
+            "actual_rate": round(actual * 100, 1), "nominal": round(p * 100, 1)}
+
+
 def review_midterm(target_date):
     """中长期复盘：对比目标日实际净值 vs 分析时净值
 
@@ -2780,6 +3139,8 @@ def review_midterm(target_date):
     dir_correct = 0
     range_hit = 0
     range_total = 0
+    winkler_sum = 0.0
+    winkler_n = 0
     for code, spec in funds.items():
         base_nav = ref_nav.get(code)
         if not base_nav:
@@ -2813,6 +3174,10 @@ def review_midterm(target_date):
             range_total += 1
             if range_hit_flag:
                 range_hit += 1
+            ws = _winkler_score(lo, hi, target_nav, base_nav)
+            if ws:
+                winkler_sum += ws["winkler"]
+                winkler_n += 1
         ok_count += 1
         if dir_ok:
             dir_correct += 1
@@ -2833,6 +3198,8 @@ def review_midterm(target_date):
         "range_hit": range_hit,
         "range_total": range_total,
         "range_rate": round(range_hit / range_total * 100, 1) if range_total else None,
+        "kupiec": _kupiec_uc_test(range_hit, range_total, p=0.80) if range_total else None,
+        "winkler": round(winkler_sum / winkler_n, 2) if winkler_n else None,
     }
     entry["status"] = "reviewed"
     entry["review"] = review

@@ -2114,6 +2114,7 @@ class Api:
                                         "msg": f"复盘建议 [{i+1}/{total}] {r.get('name','')[:16]}"}
                 code = r.get("code", "")
                 quote = None
+                target_nav = None
                 if code:
                     try:
                         info = fetch_batch([code]).get(code)
@@ -2129,9 +2130,10 @@ class Api:
                                                 "note": f"当前净值日期 {qd} 早于目标日 {fd}（T+N 滞后），待更新后自动复盘"})
                                 continue
                             quote = f"{info.get('name','')} 净值 {info.get('gz')} 今日 {info.get('gz_pct')}%"
+                            target_nav = info.get("gz")
                     except Exception:
                         pass
-                rv = fa.review_trade_advice(r, quote)
+                rv = fa.review_trade_advice(r, quote, target_nav=target_nav)
                 if rv:
                     r["status"] = "reviewed"
                     r["review"] = rv

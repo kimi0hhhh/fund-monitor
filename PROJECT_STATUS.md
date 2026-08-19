@@ -141,7 +141,18 @@ rm -rf build __pycache__
   ③**组合预测确定性**（用户明确核心是组合预测）：加 `deterministic_portfolio_direction`（持仓金额加权动量方向，回测 57.5%）；`analyze_portfolio` 组合方向确定性覆盖；`fund_monitor.analyze_all` 汇总时注入锚定动量
   ④**情绪因子**：`fetch_market_breadth`（东财涨跌分布 push2ex）+ `market_sentiment`（恐慌/正常/贪婪）+ `sentiment_adjust`（动量-情绪背离降信心+反转预警）
   ⑤**LLM 情境可信度**：组合 prompt 加 `event_flag`（事件类型+严重度）+ `event_confidence_adjust`（LLM 提语义、确定性规则降档，符合 Gao 2024「LLM 提语义+规则校准」）
-  新增：`factor_engine.py`（因子引擎）、`test_phase1*.py`/`test_portfolio_backtest.py`（回测验证：单因子动量 56%、组合加权 57.5%）。**按用户偏好不自动冒烟，用户自己打开 exe 验证组合预测**。
+  新增：`factor_engine.py`（因子引擎）、`test_phase1*.py`/`test_portfolio_backtest.py`（回测验证：单因子动量 56%、组合加权 57.5%）。**按用户偏好不自动冒烟，用户自己打开 exe 验证组合预测**。已打包部署（26MB，旧版备份为 基金监控_旧版备份.exe）+ 推送 GitHub（github.com 直连超时 → Git Data API 重放，远端 main 9d283dd → `cb025ff`）。⚠️ 本次 PAT 已明文使用，提醒删除。
+
+- **三模块前沿方法论落地 v2.0.37（2026-08-20 00:0x，未打包）**：用户要求「结合项目选取最优内容执行落地」，基于 datapro 检索的前沿文献落地三处改动（fund_analysis.py + fund_monitor.py，纯 Python 零新依赖）：
+  ①**加减仓复盘 pnl 去 LLM 化**：`review_trade_advice` 新增 `target_nav` 参数，pnl 确定性计算（BUY/ADD=(目标净值/建议净值−1)×100，SELL/REDUCE=(1−目标净值/建议净值)×100），LLM 只做 bias_type/reason 归因；`review_trade_reviews` worker 传入 `target_nav=info.gz`。治 LLM 估 pnl 的幻觉/算术错误
+  ②**中长期 trend/区间量化**：新增 `_apply_midterm_quant`——trend 用均线多头排列（compute_metrics.trend）+12-1动量兜底，target_range 用 GARCH 条件波动率 `σ_1d·√20` 算 80% 置信区间（NAV·e^{±1.28σ_20d}）；`analyze_midterm` 解析后调用覆盖 LLM 拍的值；`build_midterm_prompt` 修正字段名 bug（volatility_annual→volatility、var95→var_95）并传入均线趋势/动量/GARCH 因子
+  ③**中长期复盘 Kupiec 校准**：新增 `_kupiec_uc_test`（无条件覆盖 LR_UC 检验，χ²(1)=3.84），`review_midterm` 返回 `kupiec` 字段，验证 target_range 命中率是否=名义 80%
+  ④**预测复盘评估层升级**：新增 `_spearman_ic`（横截面 IC，Grinold-Kahn 秩相关）/ `_diebold_mariano`（AI vs 动量基线误差显著性，|DM|>1.96）/ `_brier_score`（信心分概率质量）；`review_all_predictions` 返回新增 `ic`/`dm`/`brier` 三字段（纯 Python 手写秩/统计量，零新依赖）
+  ⑤**Winkler 区间评分**：新增 `_winkler_score`（区间宽度 + 越界惩罚，相对化到基准净值%），`review_midterm` 返回 `winkler` 字段，与 Kupiec 构成区间质量双指标
+  ⑥**FinVision 式结构化 reflection**：新增 `_norm_lessons`/`_fmt_lessons`；`summarize_trade_lessons`/`summarize_prediction_lessons` 的 lessons 从自由文本列表改为结构化 `{bias_type,pattern,evidence,action}`（prompt 同步升级），`build_trade_review_context`/`build_prediction_review_context` 按结构化字段喂回；旧文本数据 `_norm_lessons` 兼容降级
+  依据论文：Hsu 2018 JPM（A股动量反向）/ MOP 2012 JFE（TSMOM 波动率缩放）/ Bollerslev 1986 GARCH / Lee 2025 Kupiec / Grinold-Kahn 2000 IC / Diebold-Mariano 1995 / Brier 1950 / Gneiting-Raftery 2007 Winkler / Fatemi-Hu 2024 FinVision。隔离单测全绿。**未打包**（按用户偏好攒需求再打包）
+
+- **v3.0.0 发版（2026-08-20 00:2x，用户要求版本直接 3.0）**：①**交易成本扣减**：`review_trade_advice` 确定性 pnl 后扣交易成本（新增 `_trade_cost_pct`：申购费 0.1% + 赎回费按持有期 <7天1.5%/<30天0.5%/≥30天0；`_hold_days` 算建议→复盘持有天数），净盈亏判定 result，返回 `pnl_pct`(净)/`gross_pnl`(毛)/`cost_pct`(成本) ②**half-Kelly 仓位**：新增 `_kelly_stats`（从已复盘净盈亏算胜率/平均盈/平均亏）+ `_half_kelly_position`（0.5×(b·p−q)/b，凯利负→0）+ `_apply_half_kelly`（有历史时用 half-Kelly 覆盖 position_change 生成「±X%（half-Kelly）」，冷启动/凯利负保留 LLM 原值），接入 `add_trade_review_from_report`。依据 Novy-Marx & Velikov 2016 RFS（交易成本）+ Kelly 1956（half-Kelly 保守）。隔离单测全绿
 
 ## 远端 v2.0.1→v2.0.5 进度（2026-08-17 拉取同步，来自 GitHub main 分支 30 commits）
 - **v2.0.1（09:56）**：`build.py` 一键构建脚本（建 venv+装依赖+打包 exe）、`requirements.txt`（pywebview 锁 5.4）、`.gitignore` 排除 .venv；悬浮窗 DPI 缩放修复（物理/逻辑像素混用→兼容缩放+坐标防越界）；悬浮窗列表排序（先涨幅再占比，get_state 加 ratio 字段）；README 加「从源码构建」一节；**GitHub Actions 自动打包**（push v* tag → PyInstaller → 上传 Release）
