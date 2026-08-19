@@ -3661,6 +3661,25 @@ function flashChangedSignals(ids){
 }
 
 // ===== 加减仓复盘 =====
+// 结构化经验教训渲染：兼容旧字符串格式与 v2.0.37+ 的结构化对象 {bias_type,pattern,evidence,action}
+function fmtLesson(x){
+  if(typeof x==='string'){
+    return '<div style="font-size:12.5px;line-height:1.6;margin-bottom:3px">• '+esc(x)+'</div>';
+  }
+  if(x && typeof x==='object'){
+    const bt=esc(x.bias_type||'其他');
+    const pat=esc(x.pattern||'');
+    const ev=esc(x.evidence||'');
+    const ac=esc(x.action||'');
+    let s='<div style="font-size:12.5px;line-height:1.65;margin-bottom:4px">• '+
+      '<span class="badge flat" style="font-size:10px;margin-right:5px">'+bt+'</span>'+pat;
+    if(ev) s+=' <span style="color:var(--sub);font-size:11.5px">（'+ev+'）</span>';
+    if(ac) s+=' <span style="color:var(--up);font-size:11.5px">→ 改进：'+ac+'</span>';
+    s+='</div>';
+    return s;
+  }
+  return '';
+}
 async function refreshTradeReviews(){
   const box=document.getElementById('trade-review-list');
   if(!box) return;
@@ -3680,7 +3699,7 @@ async function refreshTradeReviews(){
     html+='<div style="background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px">'+
       '<div style="font-size:12px;color:var(--sub);margin-bottom:6px">📚 复盘经验教训（自动喂入下次分析）'+
       (r.lessons.updated?' · '+esc(r.lessons.updated):'')+'</div>'+
-      lessons.map(x=>'<div style="font-size:12.5px;line-height:1.6;margin-bottom:3px">• '+esc(x)+'</div>').join('')+
+      lessons.map(x=>fmtLesson(x)).join('')+
       '</div>';
   }
   // 日期筛选下拉：全部 + 去重目标日倒序（优先 forecast_date，旧数据回退 date）
