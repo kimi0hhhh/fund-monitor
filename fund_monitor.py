@@ -1711,6 +1711,12 @@ class Api:
                                         "msg": f"汇总持仓数据 [{i+1}/{total}]..."}
                 history = fa.fetch_history(code, 60)
                 metrics = fa.compute_metrics(history)
+                anchor = fa.ANCHOR_MAP.get(code)
+                if anchor:
+                    adir = fa.anchor_mom12_dir(anchor)
+                    if adir in ("UP", "DOWN"):
+                        metrics["anchor_mom12_dir"] = adir
+                        metrics["anchor_symbol"] = anchor
                 holdings = fa.fetch_holdings(code)
                 funds.append({"code": code, "name": name, "value": value,
                               "gz_pct": info.get("gz_pct"), "metrics": metrics,

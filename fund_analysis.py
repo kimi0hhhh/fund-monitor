@@ -212,6 +212,63 @@ def fetch_history(code, days=90):
     return out[-days:]
 
 
+# ================== 锚定资产（期货/指数）==================
+# 基金 → 底层锚定资产（新浪期货连续主力代码）。锚定基金用锚定资产的动量判方向，
+# 保证「同锚定资产 → 同结论」，根治同类基金预测分裂（如两只黄金 ETF）。
+ANCHOR_MAP = {
+    "000217": "AU0",   # 华安黄金ETF联接C → 沪金主力
+    "002963": "AU0",   # 易方达黄金ETF联接C → 沪金主力
+    "017193": "CU0",   # 天弘工业有色金属ETF联接C → 沪铜主力
+}
+
+_futures_cache = {}
+
+
+def fetch_futures_daily(symbol, days=60):
+    """新浪期货历史日线（连续主力），返回 [{date, close}]（正序，当日缓存）。
+
+    数据源：stock2.finance.sina.com.cn InnerFuturesNewService.getDailyKLine
+    （免费公开、exe 可实时自拉，不依赖任何 MCP）。
+    """
+    key = "%s_%s" % (symbol, datetime.now().strftime("%Y-%m-%d"))
+    if key in _futures_cache:
+        return _futures_cache[key][-days:]
+    try:
+        url = ("https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t="
+               "/InnerFuturesNewService.getDailyKLine?symbol=" + symbol)
+        r = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"},
+                         timeout=10, proxies=_get_proxies())
+        m = re.search(r"\((\[.*\])\)", r.text, re.S)
+        if not m:
+            return []
+        data = json.loads(m.group(1))
+        out = [{"date": it["d"], "close": float(it["c"])} for it in data]
+        _futures_cache[key] = out
+        return out[-days:]
+    except Exception:
+        return []
+
+
+def anchor_mom12_dir(symbol, days=60):
+    """锚定资产的 12 日动量方向（跳过最近 1 日），返回 UP/DOWN/FLAT/None。
+
+    与 compute_metrics 的 mom12_dir 同一口径（Phase 1 回测验证 56%），
+    但用的是底层资产（沪金/沪铜）而非基金净值，数据更干净、同类基金天然一致。
+    """
+    hist = fetch_futures_daily(symbol, days)
+    closes = [h["close"] for h in hist]
+    rets = [(closes[i] - closes[i - 1]) / closes[i - 1] * 100
+            for i in range(1, len(closes))]
+    if len(rets) < 12:
+        return None
+    mom = sum(rets[-12:-1])
+    if mom > 0:
+        return "UP"
+    if mom < 0:
+        return "DOWN"
+    return "FLAT"
+
+
 # ================== 持仓穿透 ==================
 _holdings_cache = {}
 
@@ -253,6 +310,7 @@ def fetch_holdings(code):
 
 # ================== 市场快照 + 宏观数据 + 持仓估值 ==================
 _market_cache = {}
+_breadth_cache = {}
 _pe_cache = {}
 
 
@@ -385,6 +443,110 @@ def enrich_holdings_pe(holdings):
         return None
 
 
+def fetch_market_breadth():
+    """市场宽度（涨跌家数，东财涨跌分布接口，当日缓存）。
+
+    返回 {up, down, flat, up_ratio, date} 或 None。
+    用于「情绪状态」判断（恐慌/正常/贪婪），确定性、免费、exe 自拉。
+    """
+    key = datetime.now().strftime("%Y-%m-%d")
+    if key in _breadth_cache:
+        return _breadth_cache[key]
+    try:
+        u = ("http://push2ex.eastmoney.com/getTopicZDFenBu"
+             "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt")
+        r = requests.get(u, timeout=8, proxies=_get_proxies())
+        d = r.json()
+        data = d.get("data") or {}
+        fenbu = data.get("fenbu") or []
+        up = down = flat = 0
+        for item in fenbu:
+            for k, v in item.items():
+                k = int(k)
+                if k > 0:
+                    up += v
+                elif k < 0:
+                    down += v
+                else:
+                    flat += v
+        total = up + down
+        if total <= 0:
+            return None
+        out = {"up": up, "down": down, "flat": flat,
+               "up_ratio": round(up / total, 4), "date": str(data.get("qdate", ""))}
+        _breadth_cache[key] = out
+        return out
+    except Exception:
+        return None
+
+
+def market_sentiment(breadth=None):
+    """涨跌家数比 → 情绪标签。返回 {label, up_ratio, up, down} 或 None。
+
+    口径：上涨占比 >0.60 贪婪、<0.40 恐慌，其余正常（含涨停跌停极端）。
+    """
+    if not breadth:
+        breadth = fetch_market_breadth()
+    if not breadth:
+        return None
+    r = breadth.get("up_ratio")
+    if r is None:
+        return None
+    if r >= 0.60:
+        label = "贪婪"
+    elif r <= 0.40:
+        label = "恐慌"
+    else:
+        label = "正常"
+    return {"label": label, "up_ratio": r,
+            "up": breadth.get("up"), "down": breadth.get("down")}
+
+
+def sentiment_adjust(direction, sentiment=None):
+    """情绪因子过滤器：情绪极端降低信心，动量-情绪背离时预警反转风险。
+
+    direction: UP/DOWN（确定性动量方向）
+    sentiment: market_sentiment() 的返回（含 label 恐慌/正常/贪婪）
+    返回 {flag, hint, confidence_discount} 或 None。
+      - divergence：动量与情绪背离（动量UP但恐慌 / 动量DOWN但贪婪）→ 反转风险
+      - extreme：情绪极端（恐慌/贪婪），波动放大
+      - normal：正常
+    """
+    if not sentiment:
+        return None
+    label = sentiment.get("label")
+    d = str(direction or "").upper()
+    divergence = (d == "UP" and label == "恐慌") or (d == "DOWN" and label == "贪婪")
+    if divergence:
+        return {"flag": "divergence",
+                "hint": "动量方向与市场情绪背离（%s vs %s），趋势可能反转，信心降低" % (d, label),
+                "confidence_discount": 0.6}
+    if label in ("恐慌", "贪婪"):
+        return {"flag": "extreme",
+                "hint": "市场情绪极端（%s），波动可能放大" % label,
+                "confidence_discount": 0.8}
+    return {"flag": "normal", "hint": "市场情绪正常", "confidence_discount": 1.0}
+
+
+def event_confidence_adjust(event_flag, confidence):
+    """LLM 情境可信度：LLM 提取事件标签（只提语义），确定性规则据此降档可信度。
+
+    符合「LLM 提语义特征 + 确定性校准」的混合方法（Gao 2024 结论：
+    LLM 直接吐概率不可靠，但 LLM 提取的事件语义可喂给规则做校准）。
+    返回 (new_confidence, hint)；无重大事件时原样返回。
+    """
+    if not isinstance(event_flag, dict) or not event_flag.get("has_major_event"):
+        return confidence, None
+    severity = str(event_flag.get("severity", "")).strip()
+    etype = str(event_flag.get("event_type", "")).strip()
+    conf_map = {"高": "中", "中": "低", "低": "低"}
+    if severity == "高":
+        return conf_map.get(str(confidence), "低"), "临近重大事件（%s），方向不确定性高" % etype
+    if severity == "中":
+        return confidence, "存在事件扰动（%s）" % etype
+    return confidence, None
+
+
 def build_market_context(market=None):
     """生成「市场环境 + 风格/利率」文本段（喂 prompt），无数据返回空字符串
 
@@ -393,6 +555,12 @@ def build_market_context(market=None):
     if not market:
         return ""
     parts = []
+    # 情绪状态（涨跌家数比 → 恐慌/正常/贪婪，确定性，供 LLM 判断情绪极端与反转风险）
+    senti = market_sentiment()
+    if senti:
+        parts.append("【市场情绪（涨跌家数）】")
+        parts.append("情绪状态：%s（上涨 %d 家 / 下跌 %d 家，上涨占比 %.1f%%）" % (
+            senti["label"], senti["up"], senti["down"], senti["up_ratio"] * 100))
     hs = market.get("hs300") or {}
     sh = market.get("sh") or {}
     seg = []
@@ -577,43 +745,26 @@ def apply_posthoc_calibration(report, metrics=None):
             tf["expected_pct"] = round(raw_pct + bias, 2)
             calib["expected_pct_raw"] = raw_pct
             calib["bias_applied"] = bias
-    # 2. 方向择优覆盖（单只）：
-    #    基线方向映射 momentum→momentum_12_1_dir / reversal→reversal_dir / base→hist_freq_dir。
-    #    决策：有滚动统计时，AI 滚动方向正确率 < 最优基线滚动正确率 → 覆盖为最优基线方向；
-    #          冷启动（无滚动统计）→ 兜底均值回归（65 天回测唯一稳定过 50% 的基线）；
-    #          FLAT 基线不覆盖（平盘方向在复盘里极难命中，覆盖成平盘等于主动送错）。
+    # 2. 方向确定性覆盖（单只）：始终用确定性动量方向作为方向主判据。
+    #    优先锚定资产动量（黄金→沪金、有色→沪铜），保证同类基金同结论；
+    #    否则用基金自身 12-1 动量（Phase 1 回测验证 56.0%）。
+    #    LLM 不再决定方向，只负责解读与事件因子。
     if isinstance(tf, dict) and metrics:
         ai_dir = str(tf.get("direction", "")).upper()
-        rolling_dir_rate = rolling.get("direction_correct_rate")
-        best_bl = rolling.get("best_baseline")
-        best_bl_rate = rolling.get("best_baseline_rate")
-        baseline_dir = {
-            "momentum": metrics.get("momentum_12_1_dir"),
-            "reversal": metrics.get("reversal_dir"),
-            "base": metrics.get("hist_freq_dir"),
-        }
-        baseline_names = {"momentum": "动量基线", "reversal": "均值回归基线", "base": "历史频率基线"}
-        override_key = None
-        override_tag = ""
-        if best_bl and best_bl_rate is not None:
-            # 有基线滚动统计：AI 跑不过最优基线才覆盖
-            if rolling_dir_rate is None or rolling_dir_rate < best_bl_rate:
-                override_key = best_bl
-                override_tag = "择优覆盖（最优基线）"
-        else:
-            # 无基线统计（冷启动，或旧数据尚未生成 baseline_rates）→ 兜底均值回归（回测最强）
-            override_key = "reversal"
-            override_tag = "兜底均值回归"
-        if override_key:
-            bdir = baseline_dir.get(override_key)
-            if bdir in ("UP", "DOWN") and ai_dir in ("UP", "DOWN", "FLAT") and ai_dir != bdir:
-                calib["direction_raw"] = ai_dir
-                tf["direction"] = bdir
-                calib["override_baseline"] = override_key
-                calib["override_reason"] = override_tag
-                if tf.get("reason"):
-                    tf["reason"] = "%s（方向已按%s修正）" % (
-                        tf["reason"], baseline_names.get(override_key, override_key))
+        det_dir = (metrics.get("anchor_mom12_dir")
+                   or metrics.get("mom12_dir")
+                   or metrics.get("momentum_12_1_dir"))
+        if det_dir in ("UP", "DOWN") and ai_dir in ("UP", "DOWN", "FLAT") and ai_dir != det_dir:
+            calib["direction_raw"] = ai_dir
+            tf["direction"] = det_dir
+            if metrics.get("anchor_mom12_dir"):
+                calib["override_baseline"] = "anchor_" + str(metrics.get("anchor_symbol", ""))
+                calib["override_reason"] = "确定性锚定资产动量"
+            else:
+                calib["override_baseline"] = "mom12"
+                calib["override_reason"] = "确定性12-1动量"
+            if tf.get("reason"):
+                tf["reason"] = "%s（方向已按确定性动量修正）" % tf["reason"]
     # 3. 信心校准（Platt scaling）
     platt = stats.get("platt")
     if platt and report.get("confidence_score") is not None:
@@ -639,6 +790,30 @@ def apply_posthoc_calibration(report, metrics=None):
     if calib:
         report["_calibration"] = calib
     return report
+
+
+def deterministic_portfolio_direction(funds):
+    """组合确定性方向：按持仓金额加权各基金的确定性动量方向。
+
+    funds: [{code, value, metrics}]，metrics 含 mom12_dir / anchor_mom12_dir。
+    返回 (direction, up_weight, down_weight)；无法判定时返回 (None, 0.0, 0.0)。
+    """
+    up_w = down_w = 0.0
+    for f in funds or []:
+        m = f.get("metrics") or {}
+        d = m.get("anchor_mom12_dir") or m.get("mom12_dir")
+        w = float(f.get("value", 0) or 0)
+        if d == "UP":
+            up_w += w
+        elif d == "DOWN":
+            down_w += w
+    if up_w + down_w <= 0:
+        return None, 0.0, 0.0
+    if up_w > down_w:
+        return "UP", up_w, down_w
+    if down_w > up_w:
+        return "DOWN", up_w, down_w
+    return "FLAT", up_w, down_w
 
 
 def compute_metrics(history):
@@ -745,6 +920,17 @@ def compute_metrics(history):
         else:
             momentum_12_1_dir = "FLAT"
 
+    # 12 日动量方向（跳过最近 1 日，符号规则）——Phase 1 回测验证 56.0%，为确定性方向主判据
+    mom12_dir = None
+    if len(pcts) >= 13:
+        mom12 = sum(pcts[-13:-1])
+        if mom12 > 0:
+            mom12_dir = "UP"
+        elif mom12 < 0:
+            mom12_dir = "DOWN"
+        else:
+            mom12_dir = "FLAT"
+
     # 最近已收盘日方向（均值回归基线用）：last_pct_dir → reversal_dir 取反
     last_pct = pcts[-1] if pcts else 0
     last_pct_dir = "UP" if last_pct > 0.05 else ("DOWN" if last_pct < -0.05 else "FLAT")
@@ -772,6 +958,7 @@ def compute_metrics(history):
         "max_consec_down_days": max_down_days,
         "cond_vol_1d": cond_vol_1d,
         "momentum_12_1_dir": momentum_12_1_dir,
+        "mom12_dir": mom12_dir,
         "last_pct_dir": last_pct_dir,
         "reversal_dir": reversal_dir,
         "hist_freq_dir": hist_freq_dir,
@@ -1533,6 +1720,13 @@ def analyze_fund(code, name, holding_amount, shares, latest_gz, latest_pct,
     if progress_cb:
         progress_cb("计算技术指标 + 风险度量...", 25)
     metrics = compute_metrics(history)
+    # 锚定资产动量：黄金→沪金、有色→沪铜（用于确定性方向 + 同类基金一致性）
+    anchor = ANCHOR_MAP.get(code)
+    if anchor:
+        adir = anchor_mom12_dir(anchor)
+        if adir in ("UP", "DOWN"):
+            metrics["anchor_mom12_dir"] = adir
+            metrics["anchor_symbol"] = anchor
     if progress_cb:
         progress_cb("穿透持仓股...", 33)
     holdings = fetch_holdings(code)
@@ -1620,9 +1814,16 @@ PORTFOLIO_SYSTEM_PROMPT = """你是一名专业的基金组合策略师。你面
     "reason": "理由（60 字内）"
   },
   "key_risks": ["组合主要风险 1", "组合主要风险 2"],
-  "key_catalysts": ["组合潜在催化 1", "组合潜在催化 2"]
+  "key_catalysts": ["组合潜在催化 1", "组合潜在催化 2"],
+  "event_flag": {
+    "has_major_event": false,
+    "event_type": "议息/地缘/政策/财报/其他/无",
+    "severity": "高/中/低"
+  }
 }
 """
+# event_flag 说明：判断当前是否临近/存在重大事件（如美联储议息、地缘冲突、重大政策、
+# 财报季集中披露等），这些事件会带来方向判断的不确定性，用于后续确定性校准可信度。
 
 
 def build_portfolio_prompt(funds, idle_cash=0.0, signal_contexts=None, trade_review_context=None, prediction_review_context=None, market_context=None):
@@ -1726,6 +1927,40 @@ def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=No
 
     # 后处理校准（组合层：机械偏差修正 + 信心校准 + 区间，不做动量降级）
     parsed = apply_posthoc_calibration(parsed)
+
+    # 组合方向确定性覆盖：按持仓金额加权的确定性动量方向（LLM 不再决定组合方向）
+    det_dir, up_w, down_w = deterministic_portfolio_direction(funds)
+    pf = parsed.get("portfolio_forecast")
+    if det_dir in ("UP", "DOWN") and isinstance(pf, dict):
+        ai_dir = str(pf.get("direction", "")).upper()
+        if ai_dir != det_dir:
+            pf["direction"] = det_dir
+            parsed.setdefault("_calibration", {})["direction_raw"] = ai_dir
+            parsed["_calibration"]["override_baseline"] = "portfolio_mom12"
+            parsed["_calibration"]["override_reason"] = "确定性组合动量（持仓加权）"
+            if pf.get("reason"):
+                pf["reason"] = "%s（组合方向已按持仓加权动量确定性修正）" % pf["reason"]
+
+    # 情绪因子过滤器：动量-情绪背离时降信心 + 反转风险预警
+    senti = market_sentiment()
+    adj = sentiment_adjust(pf.get("direction"), senti) if isinstance(pf, dict) else None
+    if adj and adj.get("flag") in ("divergence", "extreme") and isinstance(pf, dict):
+        conf_map = {"高": "中", "中": "低", "低": "低"}
+        pf["confidence"] = conf_map.get(str(pf.get("confidence", "中")), "低")
+        if pf.get("reason"):
+            pf["reason"] = "%s（%s）" % (pf["reason"], adj["hint"])
+        parsed.setdefault("_calibration", {})["sentiment_flag"] = adj["flag"]
+        parsed["_calibration"]["sentiment_hint"] = adj["hint"]
+
+    # LLM 情境可信度：LLM 提取事件标签 → 确定性规则降档（不靠 LLM 直接吐可信度）
+    if isinstance(pf, dict):
+        new_conf, ev_hint = event_confidence_adjust(parsed.get("event_flag"),
+                                                    pf.get("confidence"))
+        if new_conf:
+            pf["confidence"] = new_conf
+            if ev_hint and pf.get("reason"):
+                pf["reason"] = "%s（%s）" % (pf["reason"], ev_hint)
+            parsed.setdefault("_calibration", {})["event_flag"] = parsed.get("event_flag")
 
     if progress_cb:
         progress_cb("完成", 100)

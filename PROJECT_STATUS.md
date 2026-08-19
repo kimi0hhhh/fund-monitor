@@ -135,6 +135,14 @@ rm -rf build __pycache__
 
 - **v2.0.35 发版（2026-08-19 20:2x，本机 10719）**：打包替换项目根目录 exe（26MB），含刚拉取的 9d283dd 中长期 `max_tokens` 3500→8000 修复（22 只持仓 JSON 不再被截断、分析落盘）。build.py `--skip-install` 打包（66s）；部署脚本结束 2 个旧进程（PID 4616/11932）+ 备份旧版 `基金监控_旧版备份.exe` + 复制；build/__pycache__/临时脚本已清理。**按用户偏好不自动冒烟，由用户自己打开 exe 验证（分析页 → 中长期）→ 应能正常生成并保存 22 只持仓的中长期报告**。语法检查通过；git 状态：fund_analysis 已随 9d283dd 合并、PROJECT_STATUS 待提交。
 
+- **v2.0.36 发版（2026-08-19 23:1x，本机 10719，确定性预测重构）**：用户质疑预测可靠性（两只黄金 ETF 预测分裂）→ 系统性诊断 + 方法论重建 + 落地。核心改动：
+  ①**方向预测确定性化**：`compute_metrics` 加 `mom12_dir`（12 日动量跳过最近 1 日，回测 56%）；`apply_posthoc_calibration` 方向从「条件性择优覆盖」改为「始终用确定性动量方向」（优先 anchor_mom12_dir → mom12_dir → momentum_12_1_dir），**LLM 不再决定方向**
+  ②**锚定一致性**：加 `ANCHOR_MAP`（000217/002963→AU0 沪金、017193→CU0 沪铜）+ `fetch_futures_daily`（新浪期货历史日线）+ `anchor_mom12_dir`，同类基金（两只黄金）方向天然一致
+  ③**组合预测确定性**（用户明确核心是组合预测）：加 `deterministic_portfolio_direction`（持仓金额加权动量方向，回测 57.5%）；`analyze_portfolio` 组合方向确定性覆盖；`fund_monitor.analyze_all` 汇总时注入锚定动量
+  ④**情绪因子**：`fetch_market_breadth`（东财涨跌分布 push2ex）+ `market_sentiment`（恐慌/正常/贪婪）+ `sentiment_adjust`（动量-情绪背离降信心+反转预警）
+  ⑤**LLM 情境可信度**：组合 prompt 加 `event_flag`（事件类型+严重度）+ `event_confidence_adjust`（LLM 提语义、确定性规则降档，符合 Gao 2024「LLM 提语义+规则校准」）
+  新增：`factor_engine.py`（因子引擎）、`test_phase1*.py`/`test_portfolio_backtest.py`（回测验证：单因子动量 56%、组合加权 57.5%）。**按用户偏好不自动冒烟，用户自己打开 exe 验证组合预测**。
+
 ## 远端 v2.0.1→v2.0.5 进度（2026-08-17 拉取同步，来自 GitHub main 分支 30 commits）
 - **v2.0.1（09:56）**：`build.py` 一键构建脚本（建 venv+装依赖+打包 exe）、`requirements.txt`（pywebview 锁 5.4）、`.gitignore` 排除 .venv；悬浮窗 DPI 缩放修复（物理/逻辑像素混用→兼容缩放+坐标防越界）；悬浮窗列表排序（先涨幅再占比，get_state 加 ratio 字段）；README 加「从源码构建」一节；**GitHub Actions 自动打包**（push v* tag → PyInstaller → 上传 Release）
 - **v2.0.2 / v2.0.3（10:53）**：**代理设置**（`proxy_config.json`，fund_monitor 与 fund_analysis 共用）+ 盘中估值指数近似兜底（跟踪标的实时行情估算，适应第三方源被屏蔽的网络）
