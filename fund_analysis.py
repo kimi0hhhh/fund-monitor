@@ -2426,7 +2426,9 @@ def analyze_midterm(funds, progress_cb=None):
         {"role": "system", "content": MIDTERM_SYSTEM_PROMPT},
         {"role": "user", "content": build_midterm_prompt(funds, market_context)},
     ]
-    r = llm_chat(messages, temperature=0.4, max_tokens=3500)
+    # 中长期一次性覆盖全部持仓（约 22 只），完整结构化 JSON 需 4000~6000+ token，
+    # max_tokens 必须留足余量，否则输出被截断 → JSON 解析失败 → 不落盘。
+    r = llm_chat(messages, temperature=0.4, max_tokens=8000)
     if not r.get("ok"):
         return {"ok": False, "msg": r.get("msg", "未知错误")}
     parsed = parse_llm_json(r.get("content", ""))
