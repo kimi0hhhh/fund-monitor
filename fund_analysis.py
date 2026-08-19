@@ -718,6 +718,23 @@ def _platt_fit(samples):
     return a, b
 
 
+def _align_pct_with_direction(direction, pct):
+    """方向翻转后让 expected_pct 符号与方向一致（保留幅度大小）。
+
+    修复 bug：方向被确定性覆盖成 UP/DOWN，但 expected_pct 仍是 LLM 给的相反符号，
+    导致「UP 配 -0.4%」自相矛盾。这里强制符号与方向对齐，保留幅度绝对值。
+    """
+    m = re.search(r"(-?\d+(?:\.\d+)?)", str(pct))
+    if not m:
+        return pct
+    val = float(m.group(1))
+    if direction == "UP" and val < 0:
+        return round(abs(val), 2)
+    if direction == "DOWN" and val > 0:
+        return round(-abs(val), 2)
+    return pct
+
+
 def apply_posthoc_calibration(report, metrics=None):
     """后处理校准（机械式，不依赖 LLM 自律）——比 prompt 提示可靠的偏差修正：
     1. 幅度修正：expected_pct += rolling.bias_pct（方向对时的系统性偏差，无条件机械修正）
@@ -765,6 +782,10 @@ def apply_posthoc_calibration(report, metrics=None):
                 calib["override_reason"] = "确定性12-1动量"
             if tf.get("reason"):
                 tf["reason"] = "%s（方向已按确定性动量修正）" % tf["reason"]
+        # 统一符号对齐：无论方向是否被覆盖，最终方向与 expected_pct 符号必须一致
+        final_dir = str(tf.get("direction", "")).upper()
+        if final_dir in ("UP", "DOWN"):
+            tf["expected_pct"] = _align_pct_with_direction(final_dir, tf.get("expected_pct"))
     # 3. 信心校准（Platt scaling）
     platt = stats.get("platt")
     if platt and report.get("confidence_score") is not None:
@@ -1940,6 +1961,10 @@ def analyze_portfolio(funds, idle_cash=0.0, progress_cb=None, signal_contexts=No
             parsed["_calibration"]["override_reason"] = "确定性组合动量（持仓加权）"
             if pf.get("reason"):
                 pf["reason"] = "%s（组合方向已按持仓加权动量确定性修正）" % pf["reason"]
+        # 统一符号对齐：无论是否覆盖方向，最终方向与 expected_pct 符号必须一致
+        final_dir = str(pf.get("direction", "")).upper()
+        if final_dir in ("UP", "DOWN"):
+            pf["expected_pct"] = _align_pct_with_direction(final_dir, pf.get("expected_pct"))
 
     # 情绪因子过滤器：动量-情绪背离时降信心 + 反转风险预警
     senti = market_sentiment()
