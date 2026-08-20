@@ -371,8 +371,8 @@ def _add_trading_days(date_str, days):
 
 def _fetch_estimate(code, base):
     """多源获取盘中估值，任一源成功即返回 (gz, pct, time, src)，全部失败返回 None。
-    源顺序：天天基金 fundgz → 东财 FundMNFInfo（iPhone UA）→ 蛋卷（自动跟随 301）→ 指数近似。
-    说明：腾讯行情盘中 p[2] 恒为 0 不提供估算；指数近似用跟踪标的（场内 ETF/指数）实时涨跌
+    源顺序：天天基金 fundgz → 东财 FundMNFInfo（iPhone UA）→ 蛋卷（自动跟随 301）→ 总仓估算。
+    说明：腾讯行情盘中 p[2] 恒为 0 不提供估算；总仓估算用精准对标标的（场内 ETF/指数）实时涨跌
     估算，仅适用于 ETF 联接/指数型基金（FUND_INDEX_MAP 内），作为第三方源被网络屏蔽时的兜底。"""
     # 1) 天天基金 fundgz（JSONP：jsonpgz({fundcode,gsz,gszzl,gztime,...})）
     try:
@@ -432,7 +432,7 @@ def _fetch_estimate(code, base):
 FUND_INDEX_MAP = {
     # ---- 指数 / ETF 联接（idx）----
     "025857": ("sz159326", "idx"),  # 华夏中证电网设备ETF联接C → 电网设备ETF华夏
-    "017193": ("sh512400", "idx"),  # 天弘中证工业有色金属联接C → 有色金属ETF南方
+    "017193": ("sz159157", "idx"),  # 天弘中证工业有色金属联接C → 有色金属ETF天弘(精准目标ETF, 跟踪工业有色金属主题指数H11059, 不含黄金)
     "016786": ("sz159845", "idx"),  # 鹏华中证1000指数增强C → 中证1000ETF华夏
     "014881": ("sz159770", "idx"),  # 天弘中证机器人联接C → 机器人ETF天弘
     "018897": ("sz159732", "idx"),  # 易方达消费电子ETF联接C → 消费电子ETF华夏
@@ -568,7 +568,10 @@ def _fetch_index_estimate(code, base):
         if m:
             p = m.group(2).split("~")
             if len(p) > 32 and _f(p[32]) is not None:
-                pct = _f(p[32])
+                raw = _f(p[32])
+                # 联接/指数增强基金业绩比较基准多为「指数×95%+现金×5%」，
+                # NAV 变动≈对标涨跌幅×0.95（现金部分几乎不动）；QDII(theme) 不折算。
+                pct = round(raw * 0.95, 2) if kind == "idx" else raw
                 gz = round(base["nav"] * (1 + pct / 100.0), 4)
                 return gz, pct, datetime.now().strftime("%Y-%m-%d %H:%M"), kind
     except Exception:
@@ -706,6 +709,19 @@ def fetch_batch(codes, confirm_map=None):
                 base["est_src"] = est[3] if len(est) > 3 else ""
         except Exception:
             pass
+    # T+2(QDII) 额外提供「今日收盘预估」= 官方净值涨跌(海外 T-1)：
+    # 收盘后官方数据已在 gz_pct(est=False) 直接复用；盘中估值态再补一次东财官方净值涨跌
+    for code, base in result.items():
+        if confirm_map.get(code, 1) > 1 and base.get("pct_close") is None:
+            if not base.get("est"):
+                base["pct_close"] = base.get("gz_pct")
+            else:
+                try:
+                    em = _fetch_em_official(code)
+                    if em and em.get("pct") is not None:
+                        base["pct_close"] = em["pct"]
+                except Exception:
+                    pass
     return result
 
 
@@ -889,12 +905,17 @@ class Api:
             if not name:
                 name = "未找到（检查代码）" if self._refreshed else "加载中..."
             pct = info.get("gz_pct")
+            pct_close = info.get("pct_close")
             gz = info.get("gz")
             shares = d.get("shares", 0.0) or 0.0
             value = shares * gz if shares and gz else 0.0
             pf = None
-            if pct is not None and value:
-                pf = value - value / (1 + pct / 100.0)
+            cd = int(d.get("confirm_days", 1))
+            # 总预估金额：T+2(QDII) 用「今日收盘预估」(官方净值涨跌) 汇总，更准；
+            # 其余基金用盘中「今日预估」
+            used_pct = pct_close if (cd > 1 and pct_close is not None) else pct
+            if used_pct is not None and value:
+                pf = value - value / (1 + used_pct / 100.0)
                 profit += pf
             total += value
             holdings += value
@@ -937,6 +958,7 @@ class Api:
                 "qdate": info.get("qdate", ""),
                 "est": info.get("est", False),
                 "est_src": info.get("est_src", ""),
+                "pct_close": pct_close,
                 "found": code in self.info,
                 "pending_count": len(d.get("pending", [])),
                 "confirm_days": int(d.get("confirm_days", 1)),
@@ -2421,10 +2443,11 @@ tbody tr:last-child td{border-bottom:none}
 .badge.est{background:rgba(var(--orange-rgb),.12);color:var(--orange)}
 .badge.nav{background:rgba(var(--sub-rgb),.15);color:var(--sub)}
 .stale{color:var(--sub);font-size:10px;margin-left:4px;font-weight:400;opacity:.85}
+.lbl{color:var(--sub);font-size:10px;margin:0 1px 0 2px;font-weight:400}
 .badge.pending{background:rgba(var(--up-rgb),.12);color:var(--up)}
 .badge.rule{background:rgba(var(--purple-rgb),.12);color:var(--purple)}
 .badge.warn{background:rgba(var(--orange-rgb),.15);color:var(--orange)}
-.pct{font-weight:700}
+.pct{font-weight:700;white-space:nowrap}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
   height:100%;color:var(--sub);gap:10px;font-size:13px}
 .empty .ic{font-size:42px;opacity:.5}
@@ -2884,6 +2907,16 @@ function pctTag(f){
   if(state&&state.market_open&&d.getHours()>=15) return '<small class="stale">收盘待更新</small>';
   return '<small class="stale">昨日收盘</small>';
 }
+function pctCellHtml(f){
+  // T+2(QDII) 双值：今日预估(盘中估值) / 今日收盘预估(官方净值涨跌)
+  if(f && f.confirm_days>1 && f.pct_close!=null){
+    return '<span class="'+cls(f.pct)+'">'+sgn(f.pct==null?0:f.pct)+'%</span>'
+      +'<small class="lbl">今日预估</small> / '
+      +'<span class="'+cls(f.pct_close)+'">'+sgn(f.pct_close)+'%</span>'
+      +'<small class="lbl">今日收盘预估</small>';
+  }
+  return (f&&f.pct==null?'--':sgn(f.pct)+'%')+pctTag(f);
+}
 
 function render(st){
   state=st;
@@ -2977,7 +3010,7 @@ function render(st){
     const tr=document.createElement('tr');
     if(f.code===selCode)tr.className='sel';
     const badge=f.est
-      ? (f.est_src==='idx'?'<span class="badge est">指数近似</span>'
+      ? (f.est_src==='idx'?'<span class="badge est">总仓估算</span>'
         : f.est_src==='holdings'?'<span class="badge est">重仓估算</span>'
         : f.est_src==='theme'?'<span class="badge est">主题近似</span>'
         : '<span class="badge est">盘中估值</span>')
@@ -2996,7 +3029,7 @@ function render(st){
     tr.innerHTML=
       '<td>'+f.code+'</td>'+
       '<td>'+esc(f.name)+badge+cd+pb+'</td>'+
-      '<td class="pct '+cls(f.pct)+'">'+(f.pct==null?'--':sgn(f.pct)+'%')+pctTag(f)+'</td>'+
+      '<td class="pct">'+pctCellHtml(f)+'</td>'+
       '<td>'+(f.today_pred?'<span class="badge '+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.direction||'')+'</span> '+esc(f.today_pred.expected_pct||'')+fdTxt(f.today_pred.forecast_date):'<span style="color:var(--sub)">--</span>')+'</td>'+
       '<td>'+(f.value?fmt(f.value):'--')+'</td>'+
       '<td>'+ratioCell+'</td>'+

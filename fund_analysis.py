@@ -213,26 +213,55 @@ def fetch_history(code, days=90):
 
 
 # ================== 锚定资产（期货/指数）==================
-# 基金 → 底层锚定资产（新浪期货连续主力代码）。锚定基金用锚定资产的动量判方向，
+# 基金 → 底层锚定资产（期货/商品代码）。锚定基金用锚定资产的动量判方向，
 # 保证「同锚定资产 → 同结论」，根治同类基金预测分裂（如两只黄金 ETF）。
+# 锚定符号语义保持通用（AU0=沪金 / CU0=沪铜），不特化某类基金。
 ANCHOR_MAP = {
-    "000217": "AU0",   # 华安黄金ETF联接C → 沪金主力
-    "002963": "AU0",   # 易方达黄金ETF联接C → 沪金主力
-    "017193": "CU0",   # 天弘工业有色金属ETF联接C → 沪铜主力
+    "000217": "AU0",   # 华安黄金ETF联接C → 沪金
+    "002963": "AU0",   # 易方达黄金ETF联接C → 沪金(与000217同锚定, 必同方向)
+    "017193": "CU0",   # 天弘工业有色金属ETF联接C → 沪铜
+}
+
+# 兜底「数据源适配层」：主源(新浪期货)失效时，锚定期货代码 → 腾讯白名单可达证券。
+# 主源 stock2.finance.sina.com.cn 在普通网络可用；公司网络/代理封锁成 1.1.1.1 拦截页时，
+# 由 fetch_futures_daily 回退到腾讯 klineweb 周线(web.ifzq.gtimg.cn，公司网络可用)。
+# 逻辑完全通用：新增任何锚定符号只需在此加一行映射。
+ANCHOR_TENCENT = {
+    "AU0": "sz399998",   # 沪金 → 中证黄金指数(与黄金ETF净值高度同步)
+    "CU0": "sz399395",   # 沪铜 → 国证有色指数
 }
 
 _futures_cache = {}
 
 
 def fetch_futures_daily(symbol, days=60):
-    """新浪期货历史日线（连续主力），返回 [{date, close}]（正序，当日缓存）。
+    """锚定资产历史日/周线，返回 [{date, close}]（正序，当日缓存）。
 
-    数据源：stock2.finance.sina.com.cn InnerFuturesNewService.getDailyKLine
-    （免费公开、exe 可实时自拉，不依赖任何 MCP）。
+    主源：新浪期货日线(stock2.finance.sina.com.cn，原设计，普通网络可用)。
+    兜底：主源失效(被封锁/超时/解析为空)时，回退腾讯白名单周线源
+          (web.ifzq.gtimg.cn/.../weekTrends，公司网络可用)。symbol 为期货/商品
+          代码(AU0/CU0)时，经 ANCHOR_TENCENT 适配层解析为腾讯证券后取周线。
+    两源均失败则返回 []。
     """
     key = "%s_%s" % (symbol, datetime.now().strftime("%Y-%m-%d"))
     if key in _futures_cache:
         return _futures_cache[key][-days:]
+    # 主源：新浪期货日线（原设计，普通网络可用）
+    out = _fetch_sina_futures_daily(symbol, days)
+    if out:
+        _futures_cache[key] = out
+        return out[-days:]
+    # 兜底：腾讯白名单周线（仅主源失效才走这里）
+    tcode = ANCHOR_TENCENT.get(symbol, symbol)
+    out = _fetch_tencent_weekly(tcode, days)
+    if out:
+        _futures_cache[key] = out
+        return out[-days:]
+    return []
+
+
+def _fetch_sina_futures_daily(symbol, days=60):
+    """主源：新浪期货连续主力日线。symbol 为期货代码(如 AU0/CU0)。"""
     try:
         url = ("https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t="
                "/InnerFuturesNewService.getDailyKLine?symbol=" + symbol)
@@ -243,8 +272,27 @@ def fetch_futures_daily(symbol, days=60):
             return []
         data = json.loads(m.group(1))
         out = [{"date": it["d"], "close": float(it["c"])} for it in data]
-        _futures_cache[key] = out
-        return out[-days:]
+        return out
+    except Exception:
+        return []
+
+
+def _fetch_tencent_weekly(tcode, days=60):
+    """兜底源：腾讯白名单周线。tcode 为腾讯代码(如 sz399998)。"""
+    try:
+        url = ("https://web.ifzq.gtimg.cn/other/klineweb/klineWeb/weekTrends"
+               "?app=web&p=1&type=qfq&code=" + tcode)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0",
+                                       "Referer": "https://gu.qq.com/"},
+                         timeout=12, proxies=_get_proxies())
+        d = r.json()
+        rows = d.get("data") or []
+        if not isinstance(rows, list) or not rows:
+            return []
+        out = [{"date": it[0], "close": float(it[1])}
+               for it in rows if isinstance(it, list) and len(it) >= 2]
+        out.sort(key=lambda x: x["date"])
+        return out
     except Exception:
         return []
 
@@ -252,8 +300,10 @@ def fetch_futures_daily(symbol, days=60):
 def anchor_mom12_dir(symbol, days=60):
     """锚定资产的 12 日动量方向（跳过最近 1 日），返回 UP/DOWN/FLAT/None。
 
-    与 compute_metrics 的 mom12_dir 同一口径（Phase 1 回测验证 56%），
-    但用的是底层资产（沪金/沪铜）而非基金净值，数据更干净、同类基金天然一致。
+    symbol 为锚定期货/商品代码(如 AU0/CU0)。主源取新浪期货日线动量；主源失效时
+    由 fetch_futures_daily 自动回退腾讯白名单周线(经 ANCHOR_TENCENT 适配层解析)。
+    与 compute_metrics 的 mom12_dir 同一口径(Phase 1 回测验证 56%)，但用底层资产
+    而非基金净值，同类基金天然一致。
     """
     hist = fetch_futures_daily(symbol, days)
     closes = [h["close"] for h in hist]
