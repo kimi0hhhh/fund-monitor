@@ -2447,6 +2447,8 @@ tbody tr:last-child td{border-bottom:none}
 .badge.pending{background:rgba(var(--up-rgb),.12);color:var(--up)}
 .badge.rule{background:rgba(var(--purple-rgb),.12);color:var(--purple)}
 .badge.warn{background:rgba(var(--orange-rgb),.15);color:var(--orange)}
+.badge.up{background:rgba(var(--up-rgb),.12);color:var(--up)}
+.badge.down{background:rgba(var(--down-rgb),.12);color:var(--down)}
 .pct{font-weight:700;white-space:nowrap}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
   height:100%;color:var(--sub);gap:10px;font-size:13px}
@@ -2908,14 +2910,15 @@ function pctTag(f){
   return '<small class="stale">昨日收盘</small>';
 }
 function pctCellHtml(f){
-  // T+2(QDII) 双值：今日预估(盘中估值) / 今日收盘预估(官方净值涨跌)
-  if(f && f.confirm_days>1 && f.pct_close!=null){
+  // T+2(QDII) 仅盘中(est=True)显示双值：今日预估(盘中估值) / 今日收盘预估(官方净值涨跌)
+  // 收盘后(est=False)官方净值即收盘价，pct==pct_close 为同一数，直接单值显示收盘价，不再重复
+  if(f && f.confirm_days>1 && f.est && f.pct_close!=null){
     return '<span class="'+cls(f.pct)+'">'+sgn(f.pct==null?0:f.pct)+'%</span>'
       +'<small class="lbl">今日预估</small> / '
       +'<span class="'+cls(f.pct_close)+'">'+sgn(f.pct_close)+'%</span>'
       +'<small class="lbl">今日收盘预估</small>';
   }
-  return (f&&f.pct==null?'--':sgn(f.pct)+'%')+pctTag(f);
+  return '<span class="'+cls(f&&f.pct)+'">'+(f&&f.pct==null?'--':sgn(f.pct)+'%')+'</span>'+pctTag(f);
 }
 
 function render(st){
@@ -3030,7 +3033,7 @@ function render(st){
       '<td>'+f.code+'</td>'+
       '<td>'+esc(f.name)+badge+cd+pb+'</td>'+
       '<td class="pct">'+pctCellHtml(f)+'</td>'+
-      '<td>'+(f.today_pred?'<span class="badge '+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.direction||'')+'</span> '+esc(f.today_pred.expected_pct||'')+fdTxt(f.today_pred.forecast_date):'<span style="color:var(--sub)">--</span>')+'</td>'+
+      '<td>'+(f.today_pred?'<span class="badge '+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.direction||'')+'</span> <span class="'+dirCls(f.today_pred.direction)+'">'+esc(f.today_pred.expected_pct||'')+'</span>'+fdTxt(f.today_pred.forecast_date):'<span style="color:var(--sub)">--</span>')+'</td>'+
       '<td>'+(f.value?fmt(f.value):'--')+'</td>'+
       '<td>'+ratioCell+'</td>'+
       '<td class="pct '+cls(f.profit)+'">'+(f.profit==null?'--':(f.value?sgn(f.profit):'--'))+'</td>'+
